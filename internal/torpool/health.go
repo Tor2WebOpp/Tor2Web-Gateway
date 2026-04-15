@@ -130,21 +130,21 @@ func probeTorSOCKS(ctx context.Context, socksPort int, backend string) error {
 		return fmt.Errorf("create socks5 dialer: %w", err)
 	}
 
-	var dialFn func(ctx context.Context, network, addr string) (net.Conn, error)
+	transport := &http.Transport{}
 
 	if cd, ok := dialer.(proxy.ContextDialer); ok {
-		dialFn = cd.DialContext
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return cd.DialContext(ctx, network, addr)
+		}
 	} else {
-		dialFn = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		}
 	}
 
 	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: dialFn,
-		},
-		Timeout: 30 * time.Second,
+		Transport: transport,
+		Timeout:   30 * time.Second,
 	}
 
 	url := fmt.Sprintf("http://%s/", backend)
