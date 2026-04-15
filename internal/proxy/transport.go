@@ -151,18 +151,22 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			continue
 		}
 
-		// Retry on 5xx responses.
-		if resp.StatusCode >= 500 {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upstream returned %d", resp.StatusCode)
-			continue
+		// Retry only on gateway-error statuses; pass everything else through.
+		if !isRetryableStatus(resp.StatusCode) {
+			return resp, nil
 		}
-
-		return resp, nil
+		resp.Body.Close()
+		lastErr = fmt.Errorf("upstream returned %d", resp.StatusCode)
 	}
 
 	if lastErr != nil {
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("no alive backends available")
+}
+
+// isRetryableStatus returns true for HTTP status codes that warrant a retry
+// on a different backend (502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout).
+func isRetryableStatus(code int) bool {
+	return code == 502 || code == 503 || code == 504
 }

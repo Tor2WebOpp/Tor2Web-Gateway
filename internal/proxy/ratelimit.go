@@ -15,6 +15,7 @@ import (
 type visitor struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time
+	mu       sync.Mutex
 }
 
 // RateLimiter enforces per-IP and global request rate limits.
@@ -22,6 +23,7 @@ type RateLimiter struct {
 	visitors sync.Map
 	global   *rate.Limiter
 	cfg      *config.RateLimitConf
+	done     chan struct{}
 }
 
 // newGlobalLimiter creates the global rate.Limiter from config.
@@ -38,22 +40,33 @@ func NewRateLimiter(cfg *config.RateLimitConf) *RateLimiter {
 	rl := &RateLimiter{
 		global: newGlobalLimiter(cfg),
 		cfg:    cfg,
+		done:   make(chan struct{}),
 	}
 	go rl.cleanup()
 	return rl
 }
 
+// Stop shuts down the background cleanup goroutine.
+func (rl *RateLimiter) Stop() {
+	close(rl.done)
+}
+
 // getLimiter returns (creating if necessary) the per-IP rate limiter for ip.
 func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 	now := time.Now()
+	if val, ok := rl.visitors.Load(ip); ok {
+		v := val.(*visitor)
+		v.mu.Lock()
+		v.lastSeen = now
+		v.mu.Unlock()
+		return v.limiter
+	}
 	v := &visitor{
 		limiter:  rate.NewLimiter(rate.Limit(rl.cfg.PerIPRPS), rl.cfg.PerIPBurst),
 		lastSeen: now,
 	}
 	actual, _ := rl.visitors.LoadOrStore(ip, v)
-	vis := actual.(*visitor)
-	vis.lastSeen = now
-	return vis.limiter
+	return actual.(*visitor).limiter
 }
 
 // cleanup runs on a ticker and removes visitors idle for more than 10 minutes.
@@ -64,14 +77,23 @@ func (rl *RateLimiter) cleanup() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		cutoff := time.Now().Add(-10 * time.Minute)
-		rl.visitors.Range(func(k, v any) bool {
-			if v.(*visitor).lastSeen.Before(cutoff) {
-				rl.visitors.Delete(k)
-			}
-			return true
-		})
+	for {
+		select {
+		case <-rl.done:
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-10 * time.Minute)
+			rl.visitors.Range(func(k, v any) bool {
+				vis := v.(*visitor)
+				vis.mu.Lock()
+				lastSeen := vis.lastSeen
+				vis.mu.Unlock()
+				if lastSeen.Before(cutoff) {
+					rl.visitors.Delete(k)
+				}
+				return true
+			})
+		}
 	}
 }
 

@@ -82,7 +82,7 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		key := r.URL.RequestURI()
+		key := r.URL.Path
 
 		if cached, ok := c.store.Get(key); ok {
 			// Cache HIT — serve from cache.

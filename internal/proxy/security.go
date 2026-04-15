@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -35,8 +36,10 @@ func blockedMethodsMiddleware(methods []string, next http.Handler) http.Handler 
 	})
 }
 
-// securityHeadersMiddleware adds hardening response headers and removes
-// headers that reveal server implementation details.
+// securityHeadersMiddleware adds hardening response headers before calling next.
+// Information-leaking upstream headers (Server, X-Powered-By, Via) must be
+// stripped in the ReverseProxy's ModifyResponse, not here, because they are
+// written by the upstream before this middleware can delete them.
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -44,22 +47,19 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "same-origin")
 		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 
 		next.ServeHTTP(w, r)
-
-		// Remove information-leaking headers after the handler has run.
-		h.Del("Server")
-		h.Del("X-Powered-By")
-		h.Del("Via")
 	})
 }
 
-// recoveryMiddleware catches panics from downstream handlers and returns a
-// 500 response instead of crashing the server.
+// recoveryMiddleware catches panics from downstream handlers, logs them with
+// a stack trace, and returns a 500 response instead of crashing the server.
 func recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				slog.Error("panic recovered", "panic", rec, "path", r.URL.Path)
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 		}()

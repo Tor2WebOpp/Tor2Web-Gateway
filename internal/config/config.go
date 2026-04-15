@@ -161,7 +161,7 @@ func fillDefaults(cfg *Config) {
 		cfg.Tor.DataDir = "/var/lib/gateway/tor"
 	}
 	if cfg.Tor.BootstrapTimeout == 0 {
-		cfg.Tor.BootstrapTimeout = 60 * time.Second
+		cfg.Tor.BootstrapTimeout = 120 * time.Second
 	}
 
 	if cfg.Pool.MaxIdleConnsPerHost == 0 {
@@ -180,7 +180,7 @@ func fillDefaults(cfg *Config) {
 		cfg.Pool.RetryAttempts = 3
 	}
 	if cfg.Pool.HealthCheckInterval == 0 {
-		cfg.Pool.HealthCheckInterval = 30 * time.Second
+		cfg.Pool.HealthCheckInterval = 5 * time.Second
 	}
 	if cfg.Pool.RebalanceInterval == 0 {
 		cfg.Pool.RebalanceInterval = 10 * time.Second
@@ -199,14 +199,14 @@ func fillDefaults(cfg *Config) {
 		cfg.Cache.MaxSizeMB = 256
 	}
 	if cfg.Cache.DefaultTTL == 0 {
-		cfg.Cache.DefaultTTL = 5 * time.Minute
+		cfg.Cache.DefaultTTL = 1 * time.Hour
 	}
 
 	if cfg.RateLimit.PerIPRPS == 0 {
-		cfg.RateLimit.PerIPRPS = 10
+		cfg.RateLimit.PerIPRPS = 30
 	}
 	if cfg.RateLimit.PerIPBurst == 0 {
-		cfg.RateLimit.PerIPBurst = 20
+		cfg.RateLimit.PerIPBurst = 60
 	}
 	if cfg.RateLimit.PerIPConns == 0 {
 		cfg.RateLimit.PerIPConns = 50
@@ -218,7 +218,7 @@ func fillDefaults(cfg *Config) {
 		cfg.RateLimit.APIBurst = 10
 	}
 	if cfg.RateLimit.GlobalRPS == 0 {
-		cfg.RateLimit.GlobalRPS = 1000
+		cfg.RateLimit.GlobalRPS = 5000
 	}
 	if cfg.RateLimit.CleanupInterval == 0 {
 		cfg.RateLimit.CleanupInterval = 5 * time.Minute

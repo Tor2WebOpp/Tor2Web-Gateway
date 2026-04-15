@@ -50,6 +50,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			slog.Error("reverse proxy error", "err", err, "path", r.URL.Path)
 			serveErrorPage(w, http.StatusBadGateway)
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("Server")
+			resp.Header.Del("X-Powered-By")
+			resp.Header.Del("Via")
+			return nil
+		},
 	}
 
 	var handler http.Handler = rp
@@ -90,10 +96,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	handler = metricsMiddleware(handler)
 
 	s.httpServer = &http.Server{
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Handler:           handler,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 * 1024, // 64 KB
 	}
 
 	return s, nil
@@ -135,12 +143,16 @@ func (s *Server) ListenAndServeTLS(domain, email string) error {
 	}
 
 	// HTTP->HTTPS redirect + ACME challenge handler on :80
-	go http.ListenAndServe(":80", certmagic.DefaultACME.HTTPChallengeHandler(
-		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			target := "https://" + r.Host + r.RequestURI
-			http.Redirect(w, r, target, http.StatusMovedPermanently)
-		}),
-	))
+	go func() {
+		if err := http.ListenAndServe(":80", certmagic.DefaultACME.HTTPChallengeHandler(
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				target := "https://" + r.Host + r.RequestURI
+				http.Redirect(w, r, target, http.StatusMovedPermanently)
+			}),
+		)); err != nil {
+			slog.Error("HTTP redirect listener failed", "error", err)
+		}
+	}()
 
 	slog.Info("gateway-proxy TLS listening", "domain", domain)
 	return s.httpServer.Serve(ln)
