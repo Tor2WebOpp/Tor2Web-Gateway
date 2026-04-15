@@ -1,0 +1,18 @@
+[Unit]
+Description=Gateway TorPool Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gateway
+ExecStart=/opt/gateway/gateway-torpool -config /etc/gateway/config.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/gateway /var/log/gateway /var/run/gateway /tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Gateway Clearnet Proxy
+After=gateway-torpool.service
+Wants=gateway-torpool.service
+
+[Service]
+Type=simple
+User=gateway
+ExecStart=/opt/gateway/gateway-proxy -config /etc/gateway/config.yaml
+Restart=always
+RestartSec=1
+LimitNOFILE=65536
+Environment=GOMEMLIMIT=1GiB
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/gateway /var/run/gateway
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
