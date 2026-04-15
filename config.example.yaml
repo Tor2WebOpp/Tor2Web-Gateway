@@ -1,0 +1,99 @@
+# Gateway configuration example
+# Copy this file to config.yaml and fill in real values.
+# Do NOT commit config.yaml to version control.
+
+# Public domain that gateway-proxy serves
+domain: "your-domain.example.com"
+
+# Email address for ACME/TLS certificate registration
+email: "admin@your-domain.example.com"
+
+# Shared secret between gateway-proxy and gateway-torpool.
+# Must be at least 32 characters. Generate with: openssl rand -hex 32
+proxy_secret: "change-me-use-openssl-rand-hex-32-output"
+
+# Cloudflare integration
+cloudflare:
+  enabled: false
+  mode: "full_strict"   # full_strict | flexible
+
+# Upstream backends that receive clearnet traffic (before Tor)
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+  - addr: "127.0.0.1:8081"
+    weight: 1
+
+# Tor configuration
+tor:
+  binary: "tor"                       # Path to tor binary or just "tor" if on $PATH
+  socks_base_port: 9050               # First SOCKS5 port; subsequent instances use +1, +2, ...
+  min_instances: 3                    # Minimum concurrent Tor instances
+  max_instances: 12                   # Maximum concurrent Tor instances
+  data_dir: "/var/lib/gateway/tor"    # Base directory for Tor data (one subdir per instance)
+  bootstrap_timeout: "60s"            # How long to wait for Tor to bootstrap
+
+# HTTP connection pool and circuit management
+pool:
+  max_idle_conns_per_host: 10
+  idle_timeout: "90s"
+  response_timeout: "30s"
+  connect_timeout: "10s"
+  retry_attempts: 3
+  health_check_interval: "30s"
+  rebalance_interval: "10s"
+  scale_cooldown: "60s"
+  scale_up_threshold: 0.80    # Fraction of pool busy before scaling up
+  scale_down_threshold: 0.20  # Fraction of pool busy before scaling down
+
+# In-memory response cache
+cache:
+  enabled: true
+  max_size_mb: 256
+  default_ttl: "5m"
+  static_extensions:
+    - ".js"
+    - ".css"
+    - ".png"
+    - ".jpg"
+    - ".woff2"
+    - ".svg"
+
+# Rate limiting
+rate_limit:
+  per_ip_rps: 10           # Requests per second per client IP
+  per_ip_burst: 20         # Burst allowance per client IP
+  per_ip_conns: 50         # Max simultaneous connections per client IP
+  api_rps: 5               # Requests per second for /api/ paths
+  api_burst: 10
+  global_rps: 1000         # Global request rate cap across all clients
+  cleanup_interval: "5m"   # How often to purge stale per-IP buckets
+
+# Security settings
+security:
+  proxy_secret_header: "X-Proxy-Secret"   # Header name carrying the shared secret
+  anonymize_logs: true                     # Truncate/hash IP addresses in logs
+  blocked_paths:
+    - "/.env"
+    - "/wp-admin"
+    - "/phpmyadmin"
+  blocked_methods:
+    - "TRACE"
+    - "TRACK"
+
+# Log output and rotation
+logging:
+  level: "info"           # debug | info | warn | error
+  format: "json"          # json | text
+  output: "stdout"        # stdout | /path/to/file.log
+  max_size_mb: 100        # Max log file size before rotation (file output only)
+  max_backups: 5          # Number of rotated log files to retain
+
+# Prometheus metrics
+metrics:
+  enabled: true
+  listen: ":9090"         # Address to expose /metrics
+
+# Admin Unix socket (used by gateway-torpool management API)
+admin:
+  socket: "/var/run/gateway/admin.sock"
