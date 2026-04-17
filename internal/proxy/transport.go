@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -14,6 +15,14 @@ import (
 	"github.com/sony/gobreaker/v2"
 	"golang.org/x/net/proxy"
 )
+
+const maxResponseBytes = 50 * 1024 * 1024 // 50 MB
+
+// limitedBody wraps a limited reader while preserving the original Closer.
+type limitedBody struct {
+	io.Reader
+	io.Closer
+}
 
 // selectBackend picks the alive backend with the lowest Score().
 // Returns nil if no alive backends exist.
@@ -100,6 +109,20 @@ func (t *TorTransport) getTransport(port int) (*http.Transport, *gobreaker.Circu
 	return tr, cb
 }
 
+// RemoveTransport closes idle connections and removes the cached transport and
+// circuit breaker for the given port. This prevents stale entries from
+// accumulating when instances are replaced.
+func (t *TorTransport) RemoveTransport(port int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if tr, ok := t.transports[port]; ok {
+		tr.CloseIdleConnections()
+		delete(t.transports, port)
+	}
+	delete(t.breakers, port)
+}
+
 // RoundTrip implements http.RoundTripper.
 func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	pool := t.poolFetcher()
@@ -153,6 +176,12 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		// Retry only on gateway-error statuses; pass everything else through.
 		if !isRetryableStatus(resp.StatusCode) {
+			if resp.Body != nil {
+				resp.Body = &limitedBody{
+					Reader: io.LimitReader(resp.Body, maxResponseBytes),
+					Closer: resp.Body,
+				}
+			}
 			return resp, nil
 		}
 		resp.Body.Close()

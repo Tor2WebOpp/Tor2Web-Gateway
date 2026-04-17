@@ -92,11 +92,11 @@ func metricsMiddleware(next http.Handler) http.Handler {
 		status := strconv.Itoa(rec.statusCode)
 		requestsTotal.WithLabelValues(r.Method, status).Inc()
 
-		// Record cache hit/miss if the header was set.
-		if xc := rec.Header().Get("X-Cache"); xc == "HIT" {
+		// Record cache hit/miss based on X-Cache header set by cache middleware.
+		switch rec.Header().Get("X-Cache") {
+		case "HIT":
 			cacheTotal.WithLabelValues("hit").Inc()
-		} else if isStaticPath(r.URL.Path, nil) {
-			// Only count misses for paths that could have been cached.
+		case "MISS":
 			cacheTotal.WithLabelValues("miss").Inc()
 		}
 	})

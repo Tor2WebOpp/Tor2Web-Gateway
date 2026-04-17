@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
@@ -25,6 +26,7 @@ type Cache struct {
 	store      *ristretto.Cache[string, *cachedResponse]
 	ttl        time.Duration
 	extensions map[string]struct{}
+	inflight   sync.Map // key -> chan struct{} — dedup concurrent cache misses
 }
 
 // NewCache creates a Cache with a ristretto backing store.
@@ -85,7 +87,7 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 		key := r.URL.Path
 
 		if cached, ok := c.store.Get(key); ok {
-			// Cache HIT — serve from cache.
+			// Cache HIT -- serve from cache.
 			w.Header().Set("X-Cache", "HIT")
 			for k, vals := range cached.Header {
 				for _, v := range vals {
@@ -97,7 +99,35 @@ func (c *Cache) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Cache MISS — proxy and potentially store.
+		// Deduplicate concurrent cache misses for the same key: if
+		// another goroutine is already fetching, wait and re-check cache.
+		if ch, loaded := c.inflight.LoadOrStore(key, make(chan struct{})); loaded {
+			// Another request is in flight -- wait for it.
+			<-ch.(chan struct{})
+			// Re-check cache after the in-flight request completes.
+			if cached, ok := c.store.Get(key); ok {
+				w.Header().Set("X-Cache", "HIT")
+				for k, vals := range cached.Header {
+					for _, v := range vals {
+						w.Header().Add(k, v)
+					}
+				}
+				w.WriteHeader(cached.StatusCode)
+				_, _ = w.Write(cached.Body)
+				return
+			}
+			// Cache still empty (e.g. non-200 upstream); fall through to proxy.
+		}
+
+		// We own the inflight slot -- make sure we clean it up.
+		defer func() {
+			if ch, ok := c.inflight.LoadAndDelete(key); ok {
+				close(ch.(chan struct{}))
+			}
+		}()
+
+		// Cache MISS -- proxy and potentially store.
+		w.Header().Set("X-Cache", "MISS")
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
 

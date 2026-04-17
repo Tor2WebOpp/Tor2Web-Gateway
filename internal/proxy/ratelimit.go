@@ -3,13 +3,20 @@ package proxy
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gateway/internal/config"
 
 	"golang.org/x/time/rate"
 )
+
+// connTracker tracks concurrent connections for a single IP.
+type connTracker struct {
+	count atomic.Int64
+}
 
 // visitor holds per-IP rate limiter state.
 type visitor struct {
@@ -20,10 +27,12 @@ type visitor struct {
 
 // RateLimiter enforces per-IP and global request rate limits.
 type RateLimiter struct {
-	visitors sync.Map
-	global   *rate.Limiter
-	cfg      *config.RateLimitConf
-	done     chan struct{}
+	visitors    sync.Map // ip -> *visitor  (general)
+	apiVisitors sync.Map // ip -> *visitor  (for /api/ routes)
+	connCounts  sync.Map // ip -> *connTracker
+	global      *rate.Limiter
+	cfg         *config.RateLimitConf
+	done        chan struct{}
 }
 
 // newGlobalLimiter creates the global rate.Limiter from config.
@@ -69,6 +78,34 @@ func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
 	return actual.(*visitor).limiter
 }
 
+// getAPILimiter returns a stricter per-IP rate limiter for /api/ routes.
+func (rl *RateLimiter) getAPILimiter(ip string) *rate.Limiter {
+	now := time.Now()
+	if val, ok := rl.apiVisitors.Load(ip); ok {
+		v := val.(*visitor)
+		v.mu.Lock()
+		v.lastSeen = now
+		v.mu.Unlock()
+		return v.limiter
+	}
+	v := &visitor{
+		limiter:  rate.NewLimiter(rate.Limit(rl.cfg.APIRPS), rl.cfg.APIBurst),
+		lastSeen: now,
+	}
+	actual, _ := rl.apiVisitors.LoadOrStore(ip, v)
+	return actual.(*visitor).limiter
+}
+
+// getConnTracker returns (creating if necessary) the connection tracker for ip.
+func (rl *RateLimiter) getConnTracker(ip string) *connTracker {
+	if val, ok := rl.connCounts.Load(ip); ok {
+		return val.(*connTracker)
+	}
+	ct := &connTracker{}
+	actual, _ := rl.connCounts.LoadOrStore(ip, ct)
+	return actual.(*connTracker)
+}
+
 // cleanup runs on a ticker and removes visitors idle for more than 10 minutes.
 func (rl *RateLimiter) cleanup() {
 	interval := rl.cfg.CleanupInterval
@@ -77,22 +114,28 @@ func (rl *RateLimiter) cleanup() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	cleanMap := func(m *sync.Map) {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		m.Range(func(k, v any) bool {
+			vis := v.(*visitor)
+			vis.mu.Lock()
+			lastSeen := vis.lastSeen
+			vis.mu.Unlock()
+			if lastSeen.Before(cutoff) {
+				m.Delete(k)
+			}
+			return true
+		})
+	}
+
 	for {
 		select {
 		case <-rl.done:
 			return
 		case <-ticker.C:
-			cutoff := time.Now().Add(-10 * time.Minute)
-			rl.visitors.Range(func(k, v any) bool {
-				vis := v.(*visitor)
-				vis.mu.Lock()
-				lastSeen := vis.lastSeen
-				vis.mu.Unlock()
-				if lastSeen.Before(cutoff) {
-					rl.visitors.Delete(k)
-				}
-				return true
-			})
+			cleanMap(&rl.visitors)
+			cleanMap(&rl.apiVisitors)
 		}
 	}
 }
@@ -107,11 +150,34 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 
 		ip := clientIP(r)
-		lim := rl.getLimiter(ip)
-		if !lim.Allow() {
-			w.Header().Set("Retry-After", "3")
-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
-			return
+
+		// Per-IP connection limit (skip when PerIPConns is not configured).
+		if rl.cfg.PerIPConns > 0 {
+			tracker := rl.getConnTracker(ip)
+			if tracker.count.Load() >= int64(rl.cfg.PerIPConns) {
+				w.Header().Set("Retry-After", "3")
+				http.Error(w, "Too Many Connections", http.StatusTooManyRequests)
+				return
+			}
+			tracker.count.Add(1)
+			defer tracker.count.Add(-1)
+		}
+
+		// Route-specific rate limiting: stricter for /api/ paths.
+		if strings.HasPrefix(r.URL.Path, "/api/") && rl.cfg.APIRPS > 0 {
+			apiLim := rl.getAPILimiter(ip)
+			if !apiLim.Allow() {
+				w.Header().Set("Retry-After", "3")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
+		} else {
+			lim := rl.getLimiter(ip)
+			if !lim.Allow() {
+				w.Header().Set("Retry-After", "3")
+				http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+				return
+			}
 		}
 
 		next.ServeHTTP(w, r)

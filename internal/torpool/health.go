@@ -42,9 +42,11 @@ func (f *failureTracker) isDead() bool {
 
 // HealthChecker periodically probes all Tor instances and replaces dead ones.
 type HealthChecker struct {
-	mgr      *Manager
-	interval time.Duration
-	trackers sync.Map // port (int) → *failureTracker
+	mgr             *Manager
+	interval        time.Duration
+	trackers        sync.Map // port (int) -> *failureTracker
+	wg              sync.WaitGroup
+	probeTransports sync.Map // port (int) -> *http.Transport
 }
 
 // NewHealthChecker returns a HealthChecker that checks at the given interval.
@@ -53,6 +55,11 @@ func NewHealthChecker(mgr *Manager, interval time.Duration) *HealthChecker {
 		mgr:      mgr,
 		interval: interval,
 	}
+}
+
+// Wait blocks until all in-flight replacement goroutines have finished.
+func (h *HealthChecker) Wait() {
+	h.wg.Wait()
 }
 
 // Run starts the health-check ticker loop.  It blocks until ctx is cancelled.
@@ -89,7 +96,7 @@ func (h *HealthChecker) checkOne(ctx context.Context, inst *TorInstance) {
 	tracker := h.trackerFor(inst.Port)
 
 	start := time.Now()
-	err := probeTorSOCKS(ctx, inst.Port, inst.Backend)
+	err := h.probeTorSOCKS(ctx, inst.Port, inst.Backend)
 	latency := time.Since(start).Milliseconds()
 
 	inst.TotalCount.Add(1)
@@ -100,8 +107,12 @@ func (h *HealthChecker) checkOne(ctx context.Context, inst *TorInstance) {
 
 		if tracker.isDead() {
 			inst.Alive.Store(false)
+			// Remove the stale probe transport for this port.
+			h.removeProbeTransport(inst.Port)
 			// Attempt to replace asynchronously to avoid blocking the check loop.
+			h.wg.Add(1)
 			go func(port int) {
+				defer h.wg.Done()
 				replaceCtx, cancel := context.WithTimeout(context.Background(), h.mgr.cfg.Tor.BootstrapTimeout+10*time.Second)
 				defer cancel()
 				h.mgr.ReplaceInstance(replaceCtx, port) //nolint:errcheck
@@ -121,26 +132,48 @@ func (h *HealthChecker) trackerFor(port int) *failureTracker {
 	return v.(*failureTracker)
 }
 
-// probeTorSOCKS dials the backend via the Tor SOCKS5 proxy and sends a HEAD
-// request.  Any HTTP response counts as success (the circuit is working).
-func probeTorSOCKS(ctx context.Context, socksPort int, backend string) error {
+// getProbeTransport returns a cached *http.Transport for the given SOCKS port,
+// creating one on first use.
+func (h *HealthChecker) getProbeTransport(socksPort int) *http.Transport {
+	if v, ok := h.probeTransports.Load(socksPort); ok {
+		return v.(*http.Transport)
+	}
+
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
-		return fmt.Errorf("create socks5 dialer: %w", err)
+		// Fallback: direct transport (should not happen with static args).
+		tr := &http.Transport{}
+		h.probeTransports.Store(socksPort, tr)
+		return tr
 	}
 
-	transport := &http.Transport{}
-
+	tr := &http.Transport{}
 	if cd, ok := dialer.(proxy.ContextDialer); ok {
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return cd.DialContext(ctx, network, addr)
 		}
 	} else {
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.Dial(network, addr)
 		}
 	}
+	h.probeTransports.Store(socksPort, tr)
+	return tr
+}
+
+// removeProbeTransport closes idle connections and removes the cached transport
+// for the given port.
+func (h *HealthChecker) removeProbeTransport(socksPort int) {
+	if v, ok := h.probeTransports.LoadAndDelete(socksPort); ok {
+		v.(*http.Transport).CloseIdleConnections()
+	}
+}
+
+// probeTorSOCKS dials the backend via the Tor SOCKS5 proxy and sends a HEAD
+// request.  Any HTTP response counts as success (the circuit is working).
+func (h *HealthChecker) probeTorSOCKS(ctx context.Context, socksPort int, backend string) error {
+	transport := h.getProbeTransport(socksPort)
 
 	client := &http.Client{
 		Transport: transport,

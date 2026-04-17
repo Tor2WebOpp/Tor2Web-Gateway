@@ -92,7 +92,11 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// 8. Recovery.
 	handler = recoveryMiddleware(handler)
 
-	// 9. Metrics (outermost).
+	// 9. Cloudflare IP validation.
+	cfValidator := NewCFValidator(cfg.Cloudflare.Enabled)
+	handler = cfValidator.Middleware(handler)
+
+	// 10. Metrics (outermost).
 	handler = metricsMiddleware(handler)
 
 	s.httpServer = &http.Server{

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -243,21 +244,41 @@ func (m *Manager) ScaleTo(ctx context.Context, target int) error {
 		target = max
 	}
 
-	m.mu.RLock()
+	m.mu.Lock()
 	current := len(m.instances)
-	m.mu.RUnlock()
+
+	if target < current {
+		// Scale down -- kill worst-scoring instances.
+		sort.Slice(m.instances, func(i, j int) bool {
+			return m.instances[i].Info().Score() < m.instances[j].Info().Score()
+		})
+		// Worst are now at the end; take them out.
+		toKill := make([]*TorInstance, len(m.instances[target:]))
+		copy(toKill, m.instances[target:])
+		m.instances = m.instances[:target]
+		m.mu.Unlock()
+
+		for _, inst := range toKill {
+			inst.Cancel()
+			inst.Alive.Store(false)
+			if inst.Process != nil {
+				inst.Process.Kill() //nolint:errcheck
+			}
+		}
+		return nil
+	}
 
 	if target > current {
-		// Find the next available port.
-		usedPorts := make(map[int]bool)
-		m.mu.RLock()
+		// Scale up -- collect used ports under lock, then spawn outside lock.
+		usedPorts := make(map[int]bool, len(m.instances))
 		for _, inst := range m.instances {
 			usedPorts[inst.Port] = true
 		}
-		m.mu.RUnlock()
+		needed := target - current
+		m.mu.Unlock()
 
 		backends := m.cfg.Backends
-		for i := 0; i < target-current; i++ {
+		for i := 0; i < needed; i++ {
 			port := m.cfg.Tor.SocksBasePort
 			for usedPorts[port] {
 				port++
@@ -272,22 +293,11 @@ func (m *Manager) ScaleTo(ctx context.Context, target int) error {
 				return fmt.Errorf("scale up: spawn port %d: %w", port, err)
 			}
 		}
-	} else if target < current {
-		// Kill excess instances from the end.
-		m.mu.Lock()
-		toKill := m.instances[target:]
-		m.instances = m.instances[:target]
-		m.mu.Unlock()
-
-		for _, inst := range toKill {
-			inst.Cancel()
-			inst.Alive.Store(false)
-			if inst.Process != nil {
-				inst.Process.Kill() //nolint:errcheck
-			}
-		}
+		return nil
 	}
 
+	// target == current, nothing to do.
+	m.mu.Unlock()
 	return nil
 }
 
