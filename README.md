@@ -1,4 +1,4 @@
-# VAMOS Gateway
+# TOR  Gateway
 
 **High-performance Tor routing gateway** — a two-component system that manages a dynamic pool of Tor instances and routes HTTP/HTTPS traffic through them with automatic TLS, caching, rate limiting, and health-based load balancing.
 
@@ -10,7 +10,7 @@
 
 ### What is this?
 
-VAMOS Gateway sits between your clients (optionally behind Cloudflare) and your upstream backends. All outbound traffic to backends is routed through Tor, providing network-level anonymity for the proxy layer. The system automatically manages Tor instances, scales them based on load, replaces dead ones, and balances traffic across them.
+TOR Gateway sits between your clients (optionally behind Cloudflare) and your upstream backends. All outbound traffic to backends is routed through Tor, providing network-level anonymity for the proxy layer. The system automatically manages Tor instances, scales them based on load, replaces dead ones, and balances traffic across them.
 
 ### Architecture
 
@@ -172,7 +172,7 @@ MIT
 
 ### Что это?
 
-VAMOS Gateway — это высокопроизводительный шлюз маршрутизации через Tor. Система из двух компонентов: прокси-сервер и менеджер пула Tor-инстансов, которые общаются через Unix-сокет.
+TOR Gateway — это высокопроизводительный шлюз маршрутизации через Tor. Система из двух компонентов: прокси-сервер и менеджер пула Tor-инстансов, которые общаются через Unix-сокет.
 
 ### Архитектура
 
@@ -260,7 +260,7 @@ sudo systemctl start gateway-torpool gateway-proxy
 
 ### 这是什么？
 
-VAMOS Gateway 是一个高性能的 Tor 路由网关。该系统由两个组件组成：代理服务器和 Tor 实例池管理器，通过 Unix 套接字通信。
+TOR Gateway 是一个高性能的 Tor 路由网关。该系统由两个组件组成：代理服务器和 Tor 实例池管理器，通过 Unix 套接字通信。
 
 ### 架构
 
