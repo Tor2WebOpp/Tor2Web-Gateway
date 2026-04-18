@@ -153,10 +153,12 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		tr, cb := t.getTransport(backend.Port)
 
 		// Clone request and rewrite for .onion backend.
+		// URL.Host = .onion (where to connect), but Host header = original domain
+		// so gate sets cookies on the correct domain for the browser.
 		outReq := req.Clone(req.Context())
 		outReq.URL.Scheme = "http"
 		outReq.URL.Host = backend.Backend
-		outReq.Host = backend.Backend
+		outReq.Host = t.cfg.Domain // keep original domain for Host header
 
 		// Inject proxy headers.
 		outReq.Header.Set("X-Proxy-Secret", t.cfg.ProxySecret)

@@ -181,10 +181,11 @@ func (h *HealthChecker) probeTorSOCKS(ctx context.Context, socksPort int, backen
 	}
 
 	url := fmt.Sprintf("http://%s/", backend)
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0")
 
 	resp, err := client.Do(req)
 	if err != nil {

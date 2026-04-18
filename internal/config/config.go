@@ -249,7 +249,7 @@ func fillDefaults(cfg *Config) {
 	}
 
 	if cfg.Admin.Socket == "" {
-		cfg.Admin.Socket = "/var/run/gateway/admin.sock"
+		cfg.Admin.Socket = "/run/gateway/torpool.sock"
 	}
 
 	if cfg.Cloudflare.Mode == "" {

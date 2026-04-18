@@ -96,4 +96,4 @@ metrics:
 
 # Admin Unix socket (used by gateway-torpool management API)
 admin:
-  socket: "/var/run/gateway/admin.sock"
+  socket: "/run/gateway/torpool.sock"

@@ -54,6 +54,9 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			resp.Header.Del("Server")
 			resp.Header.Del("X-Powered-By")
 			resp.Header.Del("Via")
+			// Remove CSP — backend app uses inline scripts that conflict
+			// with nonce-based CSP. Let the app handle its own CSP properly.
+			resp.Header.Del("Content-Security-Policy")
 			return nil
 		},
 	}
@@ -146,11 +149,14 @@ func (s *Server) ListenAndServeTLS(domain, email string) error {
 		return fmt.Errorf("tls listen: %w", err)
 	}
 
-	// HTTP->HTTPS redirect + ACME challenge handler on :80
+	// HTTP->HTTPS redirect + ACME challenge handler on :80.
+	// Redirect target uses the configured domain rather than r.Host —
+	// r.Host is attacker-controlled and would allow redirecting clients
+	// to an arbitrary domain.
 	go func() {
 		if err := http.ListenAndServe(":80", certmagic.DefaultACME.HTTPChallengeHandler(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				target := "https://" + r.Host + r.RequestURI
+				target := "https://" + domain + r.RequestURI
 				http.Redirect(w, r, target, http.StatusMovedPermanently)
 			}),
 		)); err != nil {
