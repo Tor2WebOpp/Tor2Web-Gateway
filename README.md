@@ -233,7 +233,27 @@ MIT
 
 ### Что это?
 
-TOR Gateway — мультитенантный обратный прокси, который маршрутизирует публичный HTTP/HTTPS трафик через пул Tor-инстансов на `.onion` бэкенды. Работает в двух режимах: локальный одиночный сервер или распределённая схема с одноразовыми пограничными прокси перед центральным хабом.
+TOR Gateway терминирует публичный TLS, маршрутизирует запросы по тенантам через заголовок `Host`, применяет per-tenant middleware (rate limits, regex-блоклисты, GeoIP, content sanitizer, переписывание заголовков) и отправляет upstream через Tor на `.onion` бэкенды. Health-основанный планировщик держит Tor-пул стабильным: мёртвые инстансы заменяются in-place на тех же SOCKS-портах; живые ранжируются по score из активных соединений, наблюдаемой latency и процента ошибок.
+
+### Указатель документации
+
+- [`docs/architecture.md`](docs/architecture.md) — бинарники, режимы, путь запроса, реестры.
+- [`docs/deployment.md`](docs/deployment.md) — установка от одного хоста до мульти-нодной фермы.
+- [`docs/tenants.md`](docs/tenants.md) — схема YAML тенантов, жизненный цикл, примеры.
+- [`docs/features.md`](docs/features.md) — middleware-фичи, параметры, per-tenant override.
+- [`docs/hub-api.md`](docs/hub-api.md) — форма запроса/ответа admin API и примеры `curl`.
+- [`docs/admin.md`](docs/admin.md) — сессии admin gate, CSRF, lockout.
+- [`docs/admin-ui.md`](docs/admin-ui.md) — справочник страниц встроенного UI, темы и языки.
+- [`docs/door.md`](docs/door.md) — виды cover-страниц двери и маршрутизация по slug.
+- [`docs/mirrors.md`](docs/mirrors.md) — реестр здоровья зеркал и правила вердиктов.
+- [`docs/checkhost.md`](docs/checkhost.md) — опрос check-host.net, регионы, rate limits.
+- [`docs/opsec.md`](docs/opsec.md) — модель угроз и рекомендации по hardening.
+- [`docs/tracing.md`](docs/tracing.md) — настройка OpenTelemetry-экспортёра и форма трейсов.
+- [`docs/audit.md`](docs/audit.md) — схема append-only audit log и API запросов.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — симптом-к-причине по типовым сбоям.
+- [`docs/upgrade.md`](docs/upgrade.md) — upgrade-процедура, rollback, миграция с pre-P1.
+
+Система работает в двух режимах. Локальный — одна машина: `gateway-proxy` и `gateway-torpool` на одном хосте, один или несколько тенантов, вся конфигурация в одном файле. Удалённый — роли разделены: edge-ноды `gateway-proxy` держат только публичный TLS и middleware-цепочку; центральный `gateway-hub` владеет Tor-пулом, реестром тенантов и mTLS CA. Edge-ноды одноразовые: сжёг одну, поставил другую на тот же хаб.
 
 ### Режимы — local и remote
 
@@ -321,6 +341,54 @@ sudo bash deploy/install.sh \
 
 Полная модель OPSEC — что защищено, а что нет, и рекомендуемое hardening (fail2ban, sysctl, chroot Tor data_dir) — в [`docs/opsec.md`](docs/opsec.md).
 
+### Архитектура
+
+```
+                              ┌──────────────┐
+ Client ──HTTPS──▶  edge-1    │  gateway-hub │
+                   edge-2  ──▶│  • torpool   │──SOCKS5──▶ Tor × N ──▶ .onion
+                   edge-N     │  • tenants   │
+                              │  • admin API │
+                              │  • mTLS CA   │
+                              └──────────────┘
+                               (приватная сеть:
+                                wg / https / socks-tls)
+```
+
+Edge держит всю middleware-цепочку: Prometheus-счётчики, проверку Cloudflare IP (когда включена), security-заголовки, regex-блоклист, GeoIP, per-IP и per-tenant rate limit, static cache, content sanitizer, и в самом конце reverse-proxy handler, который дозванивается до SOCKS-порта хаба. Хаб держит pool manager: спавнит Tor-процессы в границах min/max, опрашивает каждые 60 секунд, заменяет мёртвые на тех же SOCKS-портах и скейлится вверх-вниз по busy-доле. Подробнее — в [`docs/architecture.md`](docs/architecture.md).
+
+### Структура проекта
+
+```
+gateway/
+  cmd/
+    gateway-proxy/       # edge: публичный listener, middleware, TorTransport клиент
+    gateway-torpool/     # pool manager (встроен в gateway-hub в remote-режиме)
+    gateway-hub/         # центральный контроллер (реестр тенантов, admin API, mTLS CA)
+    gateway-door/        # disposable-редиректор (P2)
+  internal/
+    config/              # bootstrap-схема, YAML тенантов, fsnotify reload
+    proxy/               # host routing, middleware-цепочка
+    torpool/             # жизненный цикл Tor, health, scaler, unix socket API
+    hub/                 # реестр тенантов + зеркал, CA, admin API, config stream
+    transport/           # wireguard, https_tunnel, socks5_tls абстракции
+    feature/             # middleware-модули, по каталогу на фичу
+    shared/              # типы BackendInfo, PoolHealth, TenantInfo
+    admin/               # hidden gate + session/lockout/CSRF/audit (P3) + embed UI (P4)
+    door/                # cover handler и slug-редиректор (P2)
+    checkhost/           # клиент check-host.net (P2)
+    metrics/             # OPSEC-хеширующий labeler
+    tracing/             # OpenTelemetry абстракция
+    i18n/                # каталоги переводов (en, ru, zh)
+  deploy/
+    install.sh           # верхнеуровневый установщик
+    install/             # пошаговые скрипты
+    systemd/             # systemd-юниты
+  docs/                  # полный набор операторской документации
+  config.example.yaml    # пример bootstrap-схемы
+  tests/                 # unit + docker-compose integration + скриншоты + OPSEC lint
+```
+
 ### Быстрый старт (local mode)
 
 Требуется Go 1.25+ и Tor в `$PATH`.
@@ -343,9 +411,22 @@ sudo systemctl start gateway-torpool gateway-proxy
 
 Для remote-режима сначала ставится хаб, затем каждый edge. См. [`docs/deployment.md`](docs/deployment.md).
 
+### Конфигурация
+
+Bootstrap-схема с inline-комментариями — в [`config.example.yaml`](config.example.yaml). Тенанты и переключатели фич живут в runtime-каталоге хаба и задокументированы в [`docs/tenants.md`](docs/tenants.md) и [`docs/features.md`](docs/features.md).
+
 ### Мониторинг
 
-При `metrics.enabled: true` метрики доступны на `metrics.listen`. Привязывайте адрес к приватному интерфейсу; метрики наружу выпускать нельзя. Метки тенантов по умолчанию хэшируются, реальные имена видны только через admin API. OpenTelemetry-трассировка включается в `metrics.tracing`; конфигурация экспортёра — в [`docs/tracing.md`](docs/tracing.md).
+При `metrics.enabled: true` Prometheus-счётчики доступны на `metrics.listen`. Привязывайте адрес к приватному интерфейсу; метрики наружу выпускать нельзя. Метки тенантов по умолчанию хэшируются, реальные имена видны только через admin API. OpenTelemetry-трассировка включается в `metrics.tracing`; конфигурация экспортёра — в [`docs/tracing.md`](docs/tracing.md).
+
+Основные серии:
+
+- `gateway_requests_total{tenant,method,status}`
+- `gateway_request_duration_seconds{tenant,method}`
+- `gateway_cache_total{tenant,result}`
+- `gateway_active_connections`
+- `gateway_tor_pool_instances{state}`
+- `gateway_tor_circuit_breaker_state{port}`
 
 ### Двери и здоровье зеркал (P2)
 
@@ -367,13 +448,37 @@ P2 добавляет четвёртый бинарь — `gateway-door` — и 
 
 Планируется: федерация между хабами (отложено).
 
+### Лицензия
+
+MIT
+
 ---
 
 ## 中文
 
 ### 这是什么？
 
-TOR Gateway 是多租户反向代理，将公网 HTTP/HTTPS 流量通过 Tor 实例池路由到 `.onion` 后端。支持两种部署模式：单机本地部署，或由一次性边缘代理前置中心 Hub 的分布式部署。
+TOR Gateway 终结公网 TLS，按 `Host` 头将请求映射到租户，逐租户应用中间件（rate limit、正则黑名单、GeoIP、内容净化、Header 重写），并通过 Tor 出站到 `.onion` 后端。基于健康度的调度器保持 Tor 池稳定：失效实例在原 SOCKS 端口上原地替换；存活实例按融合活跃连接数、观察到的 latency 与错误率的 score 排序。
+
+### 文档索引
+
+- [`docs/architecture.md`](docs/architecture.md) — 二进制、模式、请求路径、注册表。
+- [`docs/deployment.md`](docs/deployment.md) — 从单机到多节点的完整安装流程。
+- [`docs/tenants.md`](docs/tenants.md) — 租户 YAML schema、生命周期、示例。
+- [`docs/features.md`](docs/features.md) — 中间件 feature、参数、per-tenant 覆盖。
+- [`docs/hub-api.md`](docs/hub-api.md) — admin API 请求/响应形态与 `curl` 示例。
+- [`docs/admin.md`](docs/admin.md) — admin gate 会话、CSRF、lockout。
+- [`docs/admin-ui.md`](docs/admin-ui.md) — 内嵌 Web UI 页面参考与主题/语言行为。
+- [`docs/door.md`](docs/door.md) — 门的 cover 类型与 slug 路由。
+- [`docs/mirrors.md`](docs/mirrors.md) — 镜像健康注册表与裁决规则。
+- [`docs/checkhost.md`](docs/checkhost.md) — check-host.net 轮询、区域、限速。
+- [`docs/opsec.md`](docs/opsec.md) — 威胁模型与加固建议。
+- [`docs/tracing.md`](docs/tracing.md) — OpenTelemetry 导出器配置与 trace 结构。
+- [`docs/audit.md`](docs/audit.md) — append-only 审计日志 schema 与查询 API。
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — 常见故障的症状到根因映射。
+- [`docs/upgrade.md`](docs/upgrade.md) — 版本升级流程、回滚、pre-P1 迁移。
+
+系统有两种部署模式。local：单机 —— `gateway-proxy` 与 `gateway-torpool` 同机部署，单个或多个租户，所有配置在同一文件。remote：角色分离 —— 边缘 `gateway-proxy` 节点只负责公网 TLS 与中间件链；中心 `gateway-hub` 拥有 Tor 池、租户注册表和 mTLS CA。边缘节点一次性 —— 烧掉一个，再起一个接到同一 Hub。
 
 ### 模式 — local 与 remote
 
@@ -461,6 +566,54 @@ Hub 有独立的入口脚本，节点类型已设为 hub，并额外生成 mTLS 
 
 完整 OPSEC 模型 — 哪些被保护、哪些没有以及建议的强化措施（fail2ban、内核 sysctl、chroot 的 Tor data_dir） — 见 [`docs/opsec.md`](docs/opsec.md)。
 
+### 架构
+
+```
+                              ┌──────────────┐
+ Client ──HTTPS──▶  edge-1    │  gateway-hub │
+                   edge-2  ──▶│  • torpool   │──SOCKS5──▶ Tor × N ──▶ .onion
+                   edge-N     │  • tenants   │
+                              │  • admin API │
+                              │  • mTLS CA   │
+                              └──────────────┘
+                               （私有网络：
+                                wg / https / socks-tls）
+```
+
+边缘运行完整中间件链：Prometheus 计数器、启用时的 Cloudflare IP 校验、安全 Header、正则黑名单、GeoIP、per-IP 与 per-tenant 速率限制、static cache、内容净化，最后是拨号到 Hub SOCKS 端口的反向代理 handler。Hub 运行 pool manager：在 min/max 边界内拉起 Tor 进程，每 60 秒探测一次，在原 SOCKS 端口上就地替换失效实例，并按繁忙比例上下扩缩。完整走查见 [`docs/architecture.md`](docs/architecture.md)。
+
+### 项目结构
+
+```
+gateway/
+  cmd/
+    gateway-proxy/       # 边缘：公网监听、中间件、TorTransport 客户端
+    gateway-torpool/     # 池管理器（remote 模式下嵌入 gateway-hub）
+    gateway-hub/         # 中心控制器（租户注册表、admin API、mTLS CA）
+    gateway-door/        # 一次性重定向器（P2）
+  internal/
+    config/              # bootstrap schema、租户 YAML、fsnotify reload
+    proxy/               # host 路由、中间件链
+    torpool/             # Tor 生命周期、health、scaler、unix socket API
+    hub/                 # 租户与镜像注册表、CA、admin API、config stream
+    transport/           # wireguard / https_tunnel / socks5_tls 抽象
+    feature/             # 中间件模块，每个 feature 一个目录
+    shared/              # BackendInfo、PoolHealth、TenantInfo 类型
+    admin/               # 隐藏 gate + session/lockout/CSRF/audit (P3) + 内嵌 UI (P4)
+    door/                # cover handler 与 slug 重定向器（P2）
+    checkhost/           # check-host.net 客户端（P2）
+    metrics/             # OPSEC 哈希的 labeler
+    tracing/             # OpenTelemetry 抽象
+    i18n/                # 翻译目录（en、ru、zh）
+  deploy/
+    install.sh           # 顶层安装器
+    install/             # 分步脚本
+    systemd/             # systemd 单元
+  docs/                  # 完整运维文档
+  config.example.yaml    # bootstrap schema 示例
+  tests/                 # 单元 + docker-compose 集成 + 截图 + OPSEC lint
+```
+
 ### 快速开始（local mode）
 
 前置：Go 1.25+，`$PATH` 中有 Tor。
@@ -483,9 +636,22 @@ sudo systemctl start gateway-torpool gateway-proxy
 
 remote 模式先装 Hub 再装各 edge，见 [`docs/deployment.md`](docs/deployment.md)。
 
+### 配置
+
+bootstrap schema 与行内注释见 [`config.example.yaml`](config.example.yaml)。租户与 feature 配置位于 Hub 的 runtime 目录，文档在 [`docs/tenants.md`](docs/tenants.md) 与 [`docs/features.md`](docs/features.md)。
+
 ### 监控
 
-`metrics.enabled: true` 时，Prometheus 指标暴露在 `metrics.listen`。绑定到私有地址，指标端点不可对外。租户标签默认哈希，原始 host 仅通过 admin API 可见。OpenTelemetry 采样在 `metrics.tracing` 开启，导出器配置见 [`docs/tracing.md`](docs/tracing.md)。
+`metrics.enabled: true` 时，Prometheus 计数器暴露在 `metrics.listen`。绑定到私有地址，指标端点不可对外。租户标签默认哈希，原始 host 仅通过 admin API 可见。OpenTelemetry 采样在 `metrics.tracing` 开启，导出器配置见 [`docs/tracing.md`](docs/tracing.md)。
+
+核心指标系列：
+
+- `gateway_requests_total{tenant,method,status}`
+- `gateway_request_duration_seconds{tenant,method}`
+- `gateway_cache_total{tenant,result}`
+- `gateway_active_connections`
+- `gateway_tor_pool_instances{state}`
+- `gateway_tor_circuit_breaker_state{port}`
 
 ### 门与镜像健康（P2）
 
@@ -506,3 +672,7 @@ P4 已交付：作为嵌入式单页应用的管理 Web 界面，仅通过 admin
 P5 已交付：完整的运维文档集（deployment、troubleshooting、upgrade）、三语 README，以及随管理 UI 一同分发的 i18n 目录。完整文档索引见英文章节顶部。
 
 后续计划：Hub 间联邦（暂缓）。
+
+### 许可证
+
+MIT
