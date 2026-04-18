@@ -274,6 +274,57 @@ func TestRun_AdminGateEnabled_IssuesSessionCookieAndRedirects(t *testing.T) {
 	}
 }
 
+// TestDeriveShutdownGrace is the regression for Bug 3.6: the shutdown
+// deadline must be ResponseTimeout+5s so an in-flight Tor request has
+// room to complete, capped at maxShutdownGrace so a misconfigured pool
+// cannot push the systemd TERM deadline into minutes, and fall back to
+// defaultShutdownGrace when ResponseTimeout is zero (legacy configs).
+func TestDeriveShutdownGrace(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		responseTimeout time.Duration
+		want            time.Duration
+	}{
+		{"default when zero", 0, defaultShutdownGrace},
+		{"default when negative", -5 * time.Second, defaultShutdownGrace},
+		{"adds slack to typical 30s", 30 * time.Second, 35 * time.Second},
+		{"adds slack to small 10s", 10 * time.Second, 15 * time.Second},
+		{"clamps at maxShutdownGrace", 120 * time.Second, maxShutdownGrace},
+		{"clamps exact edge", maxShutdownGrace, maxShutdownGrace},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveShutdownGrace(tc.responseTimeout)
+			if got != tc.want {
+				t.Fatalf("deriveShutdownGrace(%s) = %s, want %s",
+					tc.responseTimeout, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeriveShutdownGrace_ExceedsResponseTimeout asserts the derived
+// grace is strictly greater than the pool's ResponseTimeout whenever a
+// pool timeout is configured. The previous hardcoded 15s could be
+// shorter than a legitimate in-flight Tor request (ResponseTimeout
+// defaults to 30s) which would cut those requests off mid-flight.
+func TestDeriveShutdownGrace_ExceedsResponseTimeout(t *testing.T) {
+	t.Parallel()
+
+	for _, rt := range []time.Duration{
+		1 * time.Second,
+		5 * time.Second,
+		30 * time.Second,
+	} {
+		grace := deriveShutdownGrace(rt)
+		if grace <= rt {
+			t.Fatalf("grace (%s) must exceed ResponseTimeout (%s)", grace, rt)
+		}
+	}
+}
+
 // TestRun_RemoteModeDisabledSnapshotFailsFast confirms that when
 // mode=remote and the hub is unreachable, run() returns quickly rather
 // than silently booting with a disabled registry. The spec's medium-

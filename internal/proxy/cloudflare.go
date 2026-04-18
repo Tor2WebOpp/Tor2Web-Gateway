@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -9,6 +10,15 @@ import (
 	"sync"
 	"time"
 )
+
+// refreshInterval is the normal success-path cadence for pulling the
+// Cloudflare ranges. It is a var (not const) so tests can shrink it.
+var refreshInterval = 24 * time.Hour
+
+// retryBaseInterval is the first retry delay after a refresh failure.
+// Subsequent failures back off exponentially (base, base*2, base*4, ...)
+// but never exceed refreshInterval.
+var retryBaseInterval = 1 * time.Minute
 
 // CFValidator validates that incoming requests originate from Cloudflare IPs.
 type CFValidator struct {
@@ -22,54 +32,107 @@ type CFValidator struct {
 func NewCFValidator(enabled bool) *CFValidator {
 	v := &CFValidator{enabled: enabled}
 	if enabled {
-		v.refresh()
+		_ = v.refresh()
 		go v.refreshLoop()
 	}
 	return v
 }
 
-// refresh fetches the Cloudflare IPv4 and IPv6 ranges and replaces the local copy.
-func (v *CFValidator) refresh() {
-	urls := []string{
-		"https://www.cloudflare.com/ips-v4",
-		"https://www.cloudflare.com/ips-v6",
+// refresh fetches the Cloudflare IPv4 and IPv6 ranges and replaces the local
+// copy. It refuses partial commits: if either list fails to fetch or parse,
+// the in-memory set is left unchanged and a non-nil error is returned so the
+// caller can schedule a short-term retry. This prevents every IPv6-origin
+// Cloudflare request from getting 403 for 24 hours after a transient IPv6
+// endpoint failure.
+func (v *CFValidator) refresh() error {
+	nets4, err := fetchCFRanges("https://www.cloudflare.com/ips-v4")
+	if err != nil {
+		slog.Error("CF refresh: ipv4 fetch failed, keeping previous ranges", "error", err)
+		return fmt.Errorf("cf ipv4 refresh: %w", err)
 	}
-	var nets []*net.IPNet
-	client := &http.Client{Timeout: 10 * time.Second}
-	for _, url := range urls {
-		resp, err := client.Get(url)
-		if err != nil {
-			slog.Error("failed to fetch CF IPs", "url", url, "error", err)
-			continue
-		}
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			_, cidr, err := net.ParseCIDR(line)
-			if err != nil {
-				continue
-			}
-			nets = append(nets, cidr)
-		}
-		resp.Body.Close()
+	nets6, err := fetchCFRanges("https://www.cloudflare.com/ips-v6")
+	if err != nil {
+		slog.Error("CF refresh: ipv6 fetch failed, keeping previous ranges", "error", err)
+		return fmt.Errorf("cf ipv6 refresh: %w", err)
 	}
-	if len(nets) > 0 {
-		v.mu.Lock()
-		v.nets = nets
-		v.mu.Unlock()
-		slog.Info("CF IP ranges loaded", "count", len(nets))
+
+	combined := make([]*net.IPNet, 0, len(nets4)+len(nets6))
+	combined = append(combined, nets4...)
+	combined = append(combined, nets6...)
+	if len(combined) == 0 {
+		slog.Error("CF refresh: both endpoints returned zero ranges, keeping previous")
+		return fmt.Errorf("cf refresh: empty result from both endpoints")
 	}
+
+	v.mu.Lock()
+	v.nets = combined
+	v.mu.Unlock()
+	slog.Info("CF IP ranges loaded", "count", len(combined), "v4", len(nets4), "v6", len(nets6))
+	return nil
 }
 
-// refreshLoop periodically re-fetches Cloudflare IP ranges.
+// fetchCFRanges pulls one of the Cloudflare CIDR list endpoints and returns
+// the parsed nets. Returns an error on any HTTP or parse failure; the
+// caller uses this to decide whether the whole refresh should be committed.
+func fetchCFRanges(url string) ([]*net.IPNet, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get %s: status %d", url, resp.StatusCode)
+	}
+	var nets []*net.IPNet
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		_, cidr, err := net.ParseCIDR(line)
+		if err != nil {
+			continue
+		}
+		nets = append(nets, cidr)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan %s: %w", url, err)
+	}
+	if len(nets) == 0 {
+		return nil, fmt.Errorf("%s: no CIDRs parsed", url)
+	}
+	return nets, nil
+}
+
+// refreshLoop periodically re-fetches Cloudflare IP ranges. On a success it
+// schedules the next tick at refreshInterval. On failure it backs off
+// exponentially starting from retryBaseInterval, doubling each attempt, but
+// never exceeding refreshInterval. Any successful refresh resets the retry
+// counter.
 func (v *CFValidator) refreshLoop() {
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for range ticker.C {
-		v.refresh()
+	timer := time.NewTimer(refreshInterval)
+	defer timer.Stop()
+	failures := 0
+	for {
+		<-timer.C
+		if err := v.refresh(); err != nil {
+			failures++
+			next := retryBaseInterval
+			for i := 1; i < failures; i++ {
+				next *= 2
+				if next >= refreshInterval {
+					next = refreshInterval
+					break
+				}
+			}
+			slog.Warn("CF refresh: scheduling retry", "in", next, "consecutive_failures", failures)
+			timer.Reset(next)
+			continue
+		}
+		failures = 0
+		timer.Reset(refreshInterval)
 	}
 }
 

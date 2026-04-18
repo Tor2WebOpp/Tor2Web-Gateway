@@ -209,6 +209,49 @@ add_rule OUTPUT -p tcp --dport 53 -j ACCEPT
 
 log "Firewall configured"
 
+# --- Persist rules across reboots ---------------------------------------
+# Outage-9.1 fix: iptables -A / -I lives in kernel memory; a reboot
+# restores an empty ruleset and the next boot would come up unfirewalled.
+# Install the distro's persistence package and snapshot the current table.
+persist_iptables() {
+    local id=""
+    if [[ -r /etc/os-release ]]; then
+        id=$(. /etc/os-release; echo "${ID_LIKE:-$ID}")
+    fi
+    case "$id" in
+        *debian*|*ubuntu*)
+            if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+                log "  Installing iptables-persistent (persists rules across reboots)"
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null
+            fi
+            if have netfilter-persistent; then
+                netfilter-persistent save >/dev/null
+                log "  Saved via netfilter-persistent"
+            else
+                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                log "  Saved via iptables-save -> /etc/iptables/rules.v4"
+            fi
+            ;;
+        *rhel*|*fedora*|*centos*|*rocky*|*alma*)
+            if ! rpm -q iptables-services >/dev/null 2>&1; then
+                log "  Installing iptables-services (persists rules across reboots)"
+                yum install -y -q iptables-services >/dev/null 2>&1 \
+                    || dnf install -y -q iptables-services >/dev/null 2>&1
+            fi
+            systemctl enable --now iptables.service >/dev/null 2>&1 || true
+            service iptables save >/dev/null 2>&1 || iptables-save > /etc/sysconfig/iptables
+            log "  Saved via service iptables save"
+            ;;
+        *)
+            log "  WARNING: unknown distro ($id); persist iptables rules manually"
+            log "  (rules are active now but will vanish on reboot)"
+            ;;
+    esac
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+persist_iptables
+
 # ============================================
 # 9. Enable services (but only START if config is ready)
 # ============================================

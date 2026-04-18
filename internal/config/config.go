@@ -83,6 +83,14 @@ type TorConf struct {
 	MaxInstances     int           `yaml:"max_instances"`
 	DataDir          string        `yaml:"data_dir"`
 	BootstrapTimeout time.Duration `yaml:"bootstrap_timeout"`
+	// MinSuccessfulOnStart is the minimum number of Tor instances that
+	// must come up successfully during Manager.Start for the binary to
+	// continue booting. A zero value is treated as 1 — the previous
+	// all-or-nothing behaviour caused a 9-hour production outage (any
+	// single spawnInstance failure exited the process; systemd respawned
+	// into the same failure; StartLimit burned out; the service was dead
+	// forever).
+	MinSuccessfulOnStart int `yaml:"min_successful_on_start"`
 }
 
 // PoolConf controls HTTP connection pool and circuit management.

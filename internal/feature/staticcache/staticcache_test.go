@@ -602,3 +602,122 @@ func TestManyTenantsIsolated(t *testing.T) {
 		}
 	}
 }
+
+// TestSingleflightDedupsNon200Upstream is the bug 5.1 regression guard.
+// N concurrent requests for a path whose upstream returns 404 must
+// collapse to a single backend call. The non-success response is not
+// cached (404s are rejected by cacheableResponse) but all waiters must
+// share the owner's buffered 404 response rather than stampeding back
+// to the upstream.
+func TestSingleflightDedupsNon200Upstream(t *testing.T) {
+	var hits atomic.Int64
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// Block briefly so every concurrent request has time to queue
+		// up on the singleflight key before the owner completes.
+		time.Sleep(50 * time.Millisecond)
+		body := []byte("not found\n")
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write(body)
+	})
+
+	_, _, chain := buildChain(t, enableSnapshot(time.Hour), nil, backend)
+
+	const N = 50
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			chain.ServeHTTP(rec, reqFor("/missing.js", "one.example"))
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404", rec.Code)
+			}
+			if rec.Body.String() != "not found\n" {
+				t.Errorf("body = %q, want shared 404", rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+
+	got := hits.Load()
+	if got == 0 {
+		t.Fatalf("backend never hit")
+	}
+	if got > 5 {
+		t.Fatalf("backend hits = %d, want singleflight dedup (expected 1–5, N=%d)", got, N)
+	}
+}
+
+// TestCanonicalAcceptEncoding exercises the bug 5.3 helper directly so
+// callers can verify the key-normalisation contract without standing up
+// the full cache chain.
+func TestCanonicalAcceptEncoding(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"gzip", "gzip"},
+		{"GZIP", "gzip"},
+		{"gzip, deflate", "deflate,gzip"},
+		{"gzip,deflate", "deflate,gzip"},
+		{"GZIP, DEFLATE", "deflate,gzip"},
+		{"deflate, gzip", "deflate,gzip"},
+		{"gzip;q=0.5, br;q=0.9", "br,gzip"},
+		{"gzip;q=0", "" /* q=0 means refuse */},
+		{"gzip;q=0, br", "br"},
+		{"gzip;q=0.0", ""},
+		{"  gzip  ,  br  ", "br,gzip"},
+	}
+	for _, tc := range cases {
+		got := canonicalAcceptEncoding(tc.in)
+		if got != tc.want {
+			t.Errorf("canonicalAcceptEncoding(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestAcceptEncodingVariantsShareCacheKey verifies that semantically
+// equivalent Accept-Encoding headers hash to the same cache slot after
+// canonical normalisation.
+func TestAcceptEncodingVariantsShareCacheKey(t *testing.T) {
+	var hits atomic.Int64
+	body := []byte("shared-body")
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+
+	_, _, chain := buildChain(t, enableSnapshot(time.Hour), nil, backend)
+
+	variants := []string{
+		"gzip, deflate",
+		"gzip,deflate",
+		"GZIP, DEFLATE",
+		"deflate, gzip",
+		"  gzip  ,  deflate  ",
+	}
+	for i, ae := range variants {
+		req := reqFor("/app.js", "one.example")
+		req.Header.Set("Accept-Encoding", ae)
+		rec := httptest.NewRecorder()
+		chain.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("variant %d (%q): status = %d", i, ae, rec.Code)
+		}
+		if i == 0 {
+			// Give Ristretto a moment to admit the cold-miss entry.
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("backend hits = %d, want 1 (all variants should share key)", got)
+	}
+}

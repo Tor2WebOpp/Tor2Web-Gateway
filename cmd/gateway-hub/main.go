@@ -132,6 +132,9 @@ func runWithListener(ctx context.Context, cfg *config.Config, ln net.Listener) e
 		}
 
 		hc := torpool.NewHealthCheckerWithGrace(torMgr, cfg.Pool.HealthCheckInterval, cfg.Pool.QuarantineGrace)
+		// Wire the health checker's per-port cleanup hook so scale-down
+		// does not leak stale failure counters across port reuse (bug 7.3).
+		torMgr.SetPortForgetter(hc)
 		go hc.Run(ctx)
 
 		scaler := torpool.NewScaler(torMgr, cfg)

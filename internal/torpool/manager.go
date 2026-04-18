@@ -94,6 +94,14 @@ func (t *TorInstance) Info() shared.BackendInfo {
 	}
 }
 
+// PortForgetter is the subset of the HealthChecker API the Manager needs
+// to forget per-port state after scale-down. Decoupled as an interface so
+// the manager package does not pull the HealthChecker into its
+// construction contract; tests can also pass a stub.
+type PortForgetter interface {
+	ForgetPort(port int)
+}
+
 // Manager manages a pool of Tor process instances.
 type Manager struct {
 	cfg       *config.Config
@@ -107,6 +115,27 @@ type Manager struct {
 	opMu         sync.Mutex
 	shuttingDown atomic.Bool
 	startTime    time.Time
+
+	// portForgetter, when non-nil, is notified after scale-down kills
+	// an instance so per-port trackers, probe transports and
+	// replace-in-flight flags are cleared. cmd main files wire this to
+	// the HealthChecker via SetPortForgetter after both are
+	// constructed. Left unset, scale-up on a reused port would inherit
+	// stale counters from the previous instance — bug 7.3.
+	portForgetter PortForgetter
+
+	// startSpawner is injected by tests to replace spawnInstance during
+	// Manager.Start. Production code leaves it nil and Start falls through
+	// to the real spawnInstance. Test-only hook; do not expose via API.
+	startSpawner func(ctx context.Context, port int, backend string) (*TorInstance, error)
+}
+
+// SetPortForgetter wires a post-scale-down cleanup hook. Intended to be
+// called once at startup before any ScaleTo so the manager can notify
+// the health checker when a port leaves the pool. Concurrent mutation
+// of the hook is not supported.
+func (m *Manager) SetPortForgetter(pf PortForgetter) {
+	m.portForgetter = pf
 }
 
 // NewManager creates a new Manager using the provided config.
@@ -118,7 +147,20 @@ func NewManager(cfg *config.Config) *Manager {
 	}
 }
 
-// Start verifies the tor binary, creates the data directory, and spawns MinInstances tor processes.
+// Start verifies the tor binary, creates the data directory, and spawns
+// MinInstances tor processes in parallel.
+//
+// Outage fixes:
+//   - 1.2 Tolerant bootstrap. A single slow exit relay used to fail
+//     spawnInstance and take the whole binary down with it; systemd's restart
+//     loop then hammered the same instance until StartLimit burned out and
+//     the service stayed dead. Start now continues the loop on error and
+//     only fails if fewer than Tor.MinSuccessfulOnStart instances came up
+//     (default 1).
+//   - 1.3 Parallel spawn. Sequential bootstrap at MinInstances=10 meant up
+//     to 10 x 60s = 10 minutes of cold-start latency. Spawns now run in
+//     parallel under a WaitGroup, observing ctx cancellation so SIGTERM
+//     during boot exits cleanly without leaking half-started Tor processes.
 func (m *Manager) Start(ctx context.Context) error {
 	torBin := m.cfg.Tor.Binary
 	if torBin == "" {
@@ -132,19 +174,139 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("create tor data dir %q: %w", m.cfg.Tor.DataDir, err)
 	}
 
+	target := m.cfg.Tor.MinInstances
+	if target <= 0 {
+		return nil
+	}
+
 	backends := m.cfg.Backends
-	for i := 0; i < m.cfg.Tor.MinInstances; i++ {
+	type result struct {
+		port int
+		inst *TorInstance
+		err  error
+	}
+	results := make(chan result, target)
+
+	var wg sync.WaitGroup
+	for i := 0; i < target; i++ {
 		port := m.cfg.Tor.SocksBasePort + i
 		backend := ""
 		if len(backends) > 0 {
 			backend = backends[i%len(backends)].Addr
 		}
-		if err := m.spawnInstance(ctx, port, backend); err != nil {
-			return fmt.Errorf("spawn instance on port %d: %w", port, err)
+		wg.Add(1)
+		go func(port int, backend string) {
+			defer wg.Done()
+			// Check for cancellation before paying the spawn cost.
+			if ctx.Err() != nil {
+				results <- result{port: port, err: ctx.Err()}
+				return
+			}
+			inst, err := m.startSpawn(ctx, port, backend)
+			results <- result{port: port, inst: inst, err: err}
+		}(port, backend)
+	}
+	wg.Wait()
+	close(results)
+
+	// Drain results. Preserve ctx error over spawn errors so the caller
+	// sees ctx.Canceled/DeadlineExceeded rather than a random tor failure.
+	var (
+		successes []*TorInstance
+		errs      []error
+	)
+	for r := range results {
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("port %d: %w", r.port, r.err))
+			slog.Error("torpool: spawn failed during startup", "port", r.port, "error", r.err)
+			continue
+		}
+		if r.inst != nil {
+			successes = append(successes, r.inst)
 		}
 	}
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Kill any successes that managed to come up before cancellation so
+		// we don't leak tor processes.
+		for _, inst := range successes {
+			killAndWait(inst)
+		}
+		return ctxErr
+	}
+
+	minOK := m.cfg.Tor.MinSuccessfulOnStart
+	if minOK <= 0 {
+		minOK = 1
+	}
+	if minOK > target {
+		minOK = target
+	}
+
+	if len(successes) < minOK {
+		// Don't leak the handful that did come up. systemd will retry us
+		// and they'll race with fresh spawns on the same ports.
+		for _, inst := range successes {
+			killAndWait(inst)
+		}
+		return fmt.Errorf("torpool: only %d of %d instances spawned on startup (min required=%d): %w",
+			len(successes), target, minOK, errors.Join(errs...))
+	}
+
+	// Deterministic port order so slice indexes line up with SocksBasePort+i
+	// for anything downstream that assumes that layout.
+	sort.Slice(successes, func(i, j int) bool {
+		return successes[i].Port < successes[j].Port
+	})
+
+	m.mu.Lock()
+	m.instances = append(m.instances, successes...)
+	m.mu.Unlock()
+
+	slog.Info("torpool: spawned instances on startup",
+		"spawned", len(successes), "requested", target, "failed", len(errs))
 	return nil
+}
+
+// startSpawn is the indirection Manager.Start uses to create each instance.
+// Production code uses spawnInstanceReturning; tests inject a fake via
+// m.startSpawner to validate tolerance / parallelism / ctx-cancel semantics
+// without needing a real tor binary.
+func (m *Manager) startSpawn(ctx context.Context, port int, backend string) (*TorInstance, error) {
+	if m.startSpawner != nil {
+		return m.startSpawner(ctx, port, backend)
+	}
+	return m.spawnInstanceReturning(ctx, port, backend)
+}
+
+// spawnInstanceReturning wraps spawnInstance and returns the freshly-created
+// instance by pulling it back off the instances slice. spawnInstance itself
+// mutates m.instances on success; Start wants to collect results first and
+// assemble the slice in deterministic port order after all goroutines finish.
+func (m *Manager) spawnInstanceReturning(ctx context.Context, port int, backend string) (*TorInstance, error) {
+	if err := m.spawnInstance(ctx, port, backend); err != nil {
+		return nil, err
+	}
+
+	// Pull the instance we just spawned back out of m.instances so Start can
+	// re-append the full pool in deterministic order. Siblings may have
+	// appended too, so scan by port rather than by index.
+	m.mu.Lock()
+	var inst *TorInstance
+	idx := -1
+	for i, cand := range m.instances {
+		if cand.Port == port {
+			inst = cand
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		m.instances = append(m.instances[:idx], m.instances[idx+1:]...)
+	}
+	m.mu.Unlock()
+
+	return inst, nil
 }
 
 // spawnInstance creates a data dir, writes a torrc, starts the tor process,
@@ -391,9 +553,14 @@ func (m *Manager) scaleToLocked(ctx context.Context, target int) error {
 		m.mu.Unlock()
 
 		// Wait after each kill so SOCKS ports are released before the caller
-		// (or the next ScaleTo) tries to rebind.
+		// (or the next ScaleTo) tries to rebind. After the port is free we
+		// notify the health-checker so a future scale-up reusing the port
+		// does not inherit stale failure counters or probe state (bug 7.3).
 		for _, inst := range toKill {
 			killAndWait(inst)
+			if m.portForgetter != nil {
+				m.portForgetter.ForgetPort(inst.Port)
+			}
 		}
 		return nil
 	}

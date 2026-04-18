@@ -311,6 +311,137 @@ func TestTorTransportCloseDrains(t *testing.T) {
 	tt.mu.Unlock()
 }
 
+// TestRoundTrip_BodyRestoredBetweenRetries is the regression for Bug 3.1:
+// req.Clone does NOT deep-copy Body (it copies the ReadCloser pointer),
+// so without the fix the first attempt drains the reader and every
+// subsequent attempt POSTs zero bytes. The test runs a POST that fails
+// the first time with 502 and succeeds the second time; both handler
+// invocations must observe identical body bytes.
+func TestRoundTrip_BodyRestoredBetweenRetries(t *testing.T) {
+	payload := bytes.Repeat([]byte("a"), 2*1024) // 2 KB, well under maxBodyBytes.
+
+	var (
+		callCount int32
+		observed  [][]byte
+		obsMu     = make(chan struct{}, 1) // act as mutex for observed slice
+	)
+	obsMu <- struct{}{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("server read body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		<-obsMu
+		observed = append(observed, body)
+		obsMu <- struct{}{}
+
+		n := atomic.AddInt32(&callCount, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusBadGateway) // force a retry
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	host, port := hostPort(t, srv.URL)
+	targets := map[int]string{
+		9050: net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		9051: net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+	}
+	pool := []shared.BackendInfo{
+		{Port: 9050, Alive: true, Backend: "first.onion"},
+		{Port: 9051, Alive: true, Backend: "second.onion"},
+	}
+	tt := newTestTorTransport(t, targets, pool)
+	tt.cfg.Pool.RetryAttempts = 3
+	t.Cleanup(func() { _ = tt.Close() })
+
+	req, err := http.NewRequest(http.MethodPost, "https://test.local/echo", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.ContentLength = int64(len(payload))
+
+	resp, err := tt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&callCount) < 2 {
+		t.Fatalf("expected at least 2 backend calls, got %d", callCount)
+	}
+	<-obsMu
+	defer func() { obsMu <- struct{}{} }()
+	if len(observed) < 2 {
+		t.Fatalf("observed < 2 bodies: %d", len(observed))
+	}
+	for i, got := range observed {
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("attempt %d body mismatch: got %d bytes (first 16 = %x), want %d bytes (first 16 = %x)",
+				i, len(got), firstN(got, 16), len(payload), firstN(payload, 16))
+		}
+	}
+}
+
+// firstN returns the first n bytes of b (or all of b if shorter). Used
+// to keep TestRoundTrip_BodyRestoredBetweenRetries diagnostic output
+// readable when a mismatch fires.
+func firstN(b []byte, n int) []byte {
+	if len(b) < n {
+		return b
+	}
+	return b[:n]
+}
+
+// TestRoundTrip_OversizedBodyReturns413 asserts that a POST whose body
+// exceeds maxBodyBytes is rejected with the errRequestBodyTooLarge
+// sentinel (mapped to HTTP 413 by the ErrorHandler in server.go).
+// Retrying with a truncated body would silently corrupt the payload,
+// so the transport returns an error instead.
+func TestRoundTrip_OversizedBodyReturns413(t *testing.T) {
+	// maxBodyBytes + 1 so even a single extra byte trips the cap.
+	payload := bytes.Repeat([]byte("b"), maxBodyBytes+1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Should never be reached; the transport must reject before
+		// dispatching the request.
+		t.Errorf("backend unexpectedly received oversized body")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	host, port := hostPort(t, srv.URL)
+	targets := map[int]string{9050: net.JoinHostPort(host, fmt.Sprintf("%d", port))}
+	pool := []shared.BackendInfo{{Port: 9050, Alive: true, Backend: "only.onion"}}
+	tt := newTestTorTransport(t, targets, pool)
+	t.Cleanup(func() { _ = tt.Close() })
+
+	req, err := http.NewRequest(http.MethodPost, "https://test.local/upload", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.ContentLength = int64(len(payload))
+
+	resp, err := tt.RoundTrip(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatalf("expected error for oversized body, got nil")
+	}
+	if !IsRequestBodyTooLarge(err) {
+		t.Fatalf("expected errRequestBodyTooLarge, got %v", err)
+	}
+}
+
 // TestRemoveTransportClearsAllBreakersForPort checks that evicting a Tor
 // instance clears every (port, backend) breaker sharing that port.
 func TestRemoveTransportClearsAllBreakersForPort(t *testing.T) {

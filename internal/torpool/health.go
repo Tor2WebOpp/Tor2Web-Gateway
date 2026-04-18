@@ -102,6 +102,21 @@ func (h *HealthChecker) Wait() {
 	h.wg.Wait()
 }
 
+// HCWaitAdd increments the HealthChecker's internal WaitGroup. Exposed only
+// for shutdown-ordering tests in cmd/gateway-torpool that need to simulate
+// an in-flight replace without actually running the healthcheck loop.
+// Do not use in production code paths — replaceAsync is the only legitimate
+// source of additions.
+func HCWaitAdd(h *HealthChecker, delta int) {
+	h.wg.Add(delta)
+}
+
+// HCWaitDone decrements the HealthChecker's internal WaitGroup. Companion
+// to HCWaitAdd; same caveats apply.
+func HCWaitDone(h *HealthChecker) {
+	h.wg.Done()
+}
+
 // Run starts the health-check ticker loop.  It blocks until ctx is cancelled.
 func (h *HealthChecker) Run(ctx context.Context) {
 	ticker := time.NewTicker(h.interval)
@@ -274,6 +289,19 @@ func (h *HealthChecker) removeProbeTransport(socksPort int) {
 	if v, ok := h.probeTransports.LoadAndDelete(socksPort); ok {
 		v.(*http.Transport).CloseIdleConnections()
 	}
+}
+
+// ForgetPort discards all cached state for a port. It is called by the
+// torpool.Manager after it kills instances during scale-down so that a
+// later scale-up reusing the same port does not inherit stale counters,
+// probe transports, or replace-in-flight flags from the previous
+// instance. The four sync.Maps cleared here are the full set of
+// per-port state owned by HealthChecker.
+func (h *HealthChecker) ForgetPort(port int) {
+	h.trackers.Delete(port)
+	h.removeProbeTransport(port)
+	h.replacing.Delete(port)
+	h.quarantined.Delete(port)
 }
 
 // probeTorSOCKS dials the backend via the Tor SOCKS5 proxy and sends a HEAD

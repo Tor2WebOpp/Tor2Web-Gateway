@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
+	"golang.org/x/sync/singleflight"
 
 	"gateway/internal/feature"
 	"gateway/internal/shared"
@@ -98,6 +99,32 @@ type Feature struct {
 	mu    sync.RWMutex
 	cache *ristretto.Cache[string, *cacheEntry]
 	cfg   atomic.Pointer[params]
+
+	// sf deduplicates concurrent upstream fetches for the same cache key.
+	// When N requests arrive for a miss, only one reaches next.ServeHTTP;
+	// the others block on the singleflight result and get a copy of the
+	// same response buffer. This prevents thundering-herd backend storms
+	// on non-200 upstream responses (which cannot be cached) and large
+	// cold-miss assets alike.
+	sf singleflight.Group
+}
+
+// sfResult is the payload shared between the singleflight owner and
+// concurrent waiters. It captures just enough of the HTTP response to let
+// every waiter reproduce the same output.
+type sfResult struct {
+	// cacheable is true when the response satisfies cacheableResponse and
+	// has been (or is being) admitted to the Ristretto store. Waiters
+	// behave the same way either way — they replay the buffered response —
+	// but the flag lets callers distinguish for metrics/tests.
+	cacheable bool
+	// tooBig signals that the upstream response exceeded maxCacheBodySize
+	// so the owner fell through to a direct ServeHTTP. Waiters in that
+	// case must also fall through (no shared buffer is available).
+	tooBig     bool
+	statusCode int
+	header     http.Header
+	body       []byte
 }
 
 // New constructs a Feature with no cache and the feature disabled. The
@@ -217,31 +244,99 @@ func (f *Feature) Middleware(res feature.Resolver) func(http.Handler) http.Handl
 				return
 			}
 
-			rec := newCaptureRecorder(w)
-			rec.path = r.URL.Path
-			rec.reqHadAuth = r.Header.Get("Authorization") != ""
-			next.ServeHTTP(rec, r)
+			// Miss: dedup concurrent upstream fetches for the same key.
+			// The owner captures the response into an in-memory buffer
+			// and, when eligible, admits it to Ristretto. Waiters receive
+			// the buffered payload and replay it onto their own writer
+			// — this is what prevents thundering herd on non-200 upstream
+			// (which is explicitly NOT cacheable) and on cold cacheable
+			// assets alike.
+			v, _, _ := f.sf.Do(key, func() (interface{}, error) {
+				// Re-check the cache under the singleflight barrier; a
+				// previous in-flight owner may have populated between
+				// the Get above and our entry into Do.
+				if cached, ok := cache.Get(key); ok && cached != nil {
+					return &sfResult{
+						cacheable:  true,
+						statusCode: cached.StatusCode,
+						header:     cached.Header,
+						body:       cached.Body,
+					}, nil
+				}
 
-			if cacheableResponse(rec) {
-				entry := &cacheEntry{
-					StatusCode: rec.statusCode,
-					Header:     cloneHeader(rec.header),
-					Body:       append([]byte(nil), rec.body.Bytes()...),
+				rec := newCaptureRecorder(nil)
+				rec.path = r.URL.Path
+				rec.reqHadAuth = r.Header.Get("Authorization") != ""
+				next.ServeHTTP(rec, r)
+
+				// Refuse to share responses whose body exceeds the per-
+				// entry cap. The owner still gets a correct response via
+				// the normal flush() path below; waiters will re-enter
+				// the miss path as individual requests.
+				if rec.body.Len() > maxCacheBodySize {
+					return &sfResult{tooBig: true}, nil
 				}
-				cost := int64(len(entry.Body))
-				if cost <= 0 {
-					cost = 1
+
+				res := &sfResult{
+					statusCode: rec.statusCode,
+					header:     cloneHeader(rec.header),
+					body:       append([]byte(nil), rec.body.Bytes()...),
 				}
-				cost *= p.extCostMultiplier()
-				ttl := p.defaultTTL
-				if ttl <= 0 {
-					ttl = time.Hour
+				if cacheableResponse(rec) {
+					entry := &cacheEntry{
+						StatusCode: rec.statusCode,
+						Header:     cloneHeader(rec.header),
+						Body:       append([]byte(nil), rec.body.Bytes()...),
+					}
+					cost := int64(len(entry.Body))
+					if cost <= 0 {
+						cost = 1
+					}
+					cost *= p.extCostMultiplier()
+					ttl := p.defaultTTL
+					if ttl <= 0 {
+						ttl = time.Hour
+					}
+					cache.SetWithTTL(key, entry, cost, ttl)
+					res.cacheable = true
 				}
-				cache.SetWithTTL(key, entry, cost, ttl)
+				return res, nil
+			})
+
+			result, _ := v.(*sfResult)
+			if result == nil || result.tooBig {
+				// Fall through — the owner must do the actual work for
+				// its own request, and any too-big waiters each get their
+				// own upstream call. Fairly ugly but unavoidable: a too-
+				// big body cannot be buffered for reuse within the cache
+				// memory budget.
+				next.ServeHTTP(w, r)
+				return
 			}
-			rec.flush()
+
+			writeSharedResponse(w, result)
 		})
 	}
+}
+
+// writeSharedResponse replays a buffered upstream response onto w. It is
+// called both by the singleflight owner (after its own fetch) and by any
+// concurrent waiters that blocked on the same key. Waiters therefore see
+// the exact status/headers/body the owner produced. All participants are
+// logically on the miss path — subsequent requests that hit the populated
+// cache directly via Get go through writeCached and receive X-Cache: HIT.
+func writeSharedResponse(w http.ResponseWriter, r *sfResult) {
+	hdr := w.Header()
+	for k, vals := range r.header {
+		for _, v := range vals {
+			hdr.Add(k, v)
+		}
+	}
+	if _, exists := hdr["X-Cache"]; !exists {
+		hdr.Set("X-Cache", "MISS")
+	}
+	w.WriteHeader(r.statusCode)
+	_, _ = w.Write(r.body)
 }
 
 // loadCache returns the current cache pointer under a read lock. It
@@ -421,7 +516,7 @@ func tenantKey(r *http.Request) string {
 	hostHeader := strings.ToLower(r.Host)
 	cleanPath := path.Clean("/" + strings.TrimLeft(r.URL.Path, "/"))
 	sortedQuery := canonicaliseQuery(r.URL.RawQuery)
-	accEnc := classifyAcceptEncoding(r.Header.Get("Accept-Encoding"))
+	accEnc := canonicalAcceptEncoding(r.Header.Get("Accept-Encoding"))
 
 	h := sha256.New()
 	// Tenant prefix — not part of the spec's formula but required to
@@ -453,20 +548,75 @@ func canonicaliseQuery(raw string) string {
 	return strings.Join(pairs, "&")
 }
 
-// classifyAcceptEncoding reduces Accept-Encoding to one of three buckets.
-// This avoids key explosion while still keeping gzip/br/identity entries
-// separate, which is critical since a response encoded for one cannot be
-// served to a client that asked for another.
-func classifyAcceptEncoding(v string) string {
-	v = strings.ToLower(v)
-	switch {
-	case strings.Contains(v, "br"):
-		return "br"
-	case strings.Contains(v, "gzip"):
-		return "gzip"
-	default:
-		return "identity"
+// canonicalAcceptEncoding normalises the Accept-Encoding header so that
+// semantically equivalent variants ("gzip, deflate", "gzip,deflate",
+// "GZIP, DEFLATE") hash to the same cache key. The algorithm is:
+//
+//  1. Lowercase the header value.
+//  2. Split on commas.
+//  3. For each coding, strip whitespace and q-parameters.
+//  4. Drop empty tokens and tokens with q=0 (client forbids this coding).
+//  5. Sort alphabetically.
+//  6. Re-join with ",".
+//
+// An empty input is treated as the empty canonical string — the same
+// bucket clients would land in when they send no Accept-Encoding. A
+// response encoded for one accepted set cannot be served to a client
+// that did not list it, so the canonical form still segregates entries
+// by actually-accepted codings.
+func canonicalAcceptEncoding(h string) string {
+	if h == "" {
+		return ""
 	}
+	h = strings.ToLower(h)
+	parts := strings.Split(h, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// A coding can include parameters: "gzip;q=0.5". The coding
+		// itself is everything before the first semicolon.
+		coding := p
+		qZero := false
+		if i := strings.IndexByte(p, ';'); i >= 0 {
+			coding = strings.TrimSpace(p[:i])
+			params := strings.Split(p[i+1:], ";")
+			for _, param := range params {
+				param = strings.TrimSpace(param)
+				if param == "q=0" || strings.HasPrefix(param, "q=0.") &&
+					isAllZero(param[len("q=0."):]) {
+					qZero = true
+					break
+				}
+			}
+		}
+		if coding == "" || qZero {
+			continue
+		}
+		out = append(out, coding)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
+}
+
+// isAllZero reports whether every character of s is '0'. Used by
+// canonicalAcceptEncoding to recognise q=0, q=0.0, q=0.00, ... as all
+// meaning "refuse this coding".
+func isAllZero(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 // writeCached serialises a cache entry onto w.

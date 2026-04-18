@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +22,20 @@ import (
 
 	"github.com/sony/gobreaker/v2"
 )
+
+// errRequestBodyTooLarge is returned by RoundTrip when a retryable method's
+// body exceeds maxBodyBytes. It is surfaced as 413 Request Entity Too Large
+// by the reverse-proxy ErrorHandler. Sentinel so the error-handler can
+// distinguish this case from a generic upstream failure.
+var errRequestBodyTooLarge = errors.New("request body exceeds max_body_bytes")
+
+// IsRequestBodyTooLarge reports whether err (or any wrapped err) is the
+// sentinel returned when a retryable request body is larger than the
+// configured cap. Exposed so the ErrorHandler in server.go can translate
+// it into a 413 response without sharing a type.
+func IsRequestBodyTooLarge(err error) bool {
+	return errors.Is(err, errRequestBodyTooLarge)
+}
 
 // maxResponseBytes is the default ceiling applied to buffered / non-streaming
 // responses to prevent runaway backend replies from consuming edge memory.
@@ -292,6 +308,42 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		tenantKey = tenant.Host
 	}
 
+	// Body buffering for retryable methods. http.Request.Clone does NOT
+	// deep-copy Body (it copies the ReadCloser pointer), so the first
+	// attempt drains the reader and later attempts see EOF and ship a
+	// zero-byte body. Buffering once up front lets us hand each attempt
+	// a fresh bytes.Reader.
+	//
+	// We only buffer for methods that carry bodies in the proxy path.
+	// GET/HEAD/OPTIONS requests either carry no body at all or a body
+	// the server must ignore per RFC 9110; skipping the buffering keeps
+	// GET traffic allocation-free.
+	//
+	// The cap mirrors the maxBodyBytes enforced by the inbound
+	// maxBodyMiddleware so that an upstream-facing retry cannot consume
+	// more memory than a single inbound request already could. A request
+	// that exceeds the cap is rejected with errRequestBodyTooLarge which
+	// the ErrorHandler surfaces as 413 — retrying with a truncated body
+	// would silently corrupt the payload, which is worse than failing.
+	var bodyBytes []byte
+	if req.Body != nil && methodHasRetryableBody(req.Method) {
+		buf, err := io.ReadAll(io.LimitReader(req.Body, maxBodyBytes+1))
+		closeErr := req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read request body: %w", err)
+		}
+		if closeErr != nil && !errors.Is(closeErr, io.EOF) {
+			// Close errors are logged but non-fatal: the body bytes we
+			// already buffered are authoritative. Falling through would
+			// drop a valid request over a best-effort close failure.
+			slog.Debug("close original request body", "err", closeErr)
+		}
+		if int64(len(buf)) > maxBodyBytes {
+			return nil, errRequestBodyTooLarge
+		}
+		bodyBytes = buf
+	}
+
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// Build a filtered pool excluding already-tried ports and any
 		// backends whose (tenant, onion) is negatively cached.
@@ -322,6 +374,19 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		outReq := req.Clone(req.Context())
 		outReq.URL.Scheme = "http"
 		outReq.URL.Host = backend.Backend
+
+		// Restore the body from our buffered copy so attempt N+1 sends
+		// the same bytes attempt N did. req.Clone copies the Body
+		// pointer, which would otherwise hand a drained reader to the
+		// retry. ContentLength is overwritten in lockstep so
+		// http.Transport does not silently switch to chunked.
+		if bodyBytes != nil {
+			outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			outReq.ContentLength = int64(len(bodyBytes))
+			outReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
+		}
 		// Preserve the incoming Host so cookies and backend-side
 		// routing keep working; in multi-tenant mode this is the
 		// tenant's public host, in legacy mode it's cfg.Domain.
@@ -425,4 +490,18 @@ func (t *TorTransport) recordSuccess(tenant, onion string) {
 // on a different backend (502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout).
 func isRetryableStatus(code int) bool {
 	return code == 502 || code == 503 || code == 504
+}
+
+// methodHasRetryableBody reports whether method is one where a non-nil
+// Body is both meaningful to the backend and worth preserving across
+// retry attempts. GET/HEAD/OPTIONS intentionally fall through: per RFC
+// 9110 any body they carry has no defined semantics, so the proxy will
+// not buffer it.
+func methodHasRetryableBody(method string) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }

@@ -2,14 +2,21 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"gateway/internal/config"
+	"gateway/internal/shared"
 )
 
 // captureRT is an http.RoundTripper that records the request it sees and
@@ -200,5 +207,155 @@ func TestRedirectServer_ReadHeaderTimeout_ClosesIdleConn(t *testing.T) {
 		if errors.As(err, &ne) && ne.Timeout() {
 			t.Fatalf("server did not close conn after ReadHeaderTimeout: %v", err)
 		}
+	}
+}
+
+// blockingManager is a certManager fake whose ManageSync blocks until
+// the caller's context is cancelled. It lets TestListenAndServeTLS_ManageSyncTimeout
+// assert that unbounded ACME orders no longer freeze startup.
+type blockingManager struct {
+	started atomic.Int32
+}
+
+func (b *blockingManager) ManageSync(ctx context.Context, _ []string) error {
+	b.started.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (b *blockingManager) TLSConfig() *tls.Config {
+	return &tls.Config{}
+}
+
+// TestListenAndServeTLS_ManageSyncTimeout is the regression for Bug 2.1:
+// without the fix, listenAndServeTLSWithManager used
+// context.Background() and would wait forever for ACME. With the fix in
+// place the deadline is observed and the helper returns a wrapped
+// context.DeadlineExceeded error well inside 2x the configured margin.
+func TestListenAndServeTLS_ManageSyncTimeout(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{httpServer: &http.Server{}}
+
+	// Shrink the surrounding context so the test is bounded; the real
+	// manageSyncTimeout is 60s, which would turn this into an
+	// unacceptable CI timer. The wider deadline (400ms) gives
+	// listenAndServeTLSWithManager time to return after its inner
+	// ManageSync context fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	bm := &blockingManager{}
+
+	errCh := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		errCh <- s.listenAndServeTLSWithManager(ctx, "example.test", bm)
+	}()
+
+	select {
+	case err := <-errCh:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatalf("expected timeout error, got nil (elapsed %s)", elapsed)
+		}
+		if !strings.Contains(err.Error(), "certmagic manage") {
+			t.Fatalf("error should mention certmagic manage, got %v", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected wrapped DeadlineExceeded, got %v", err)
+		}
+		// 2x margin: the outer ctx is 400ms, so anything under 800ms
+		// is fine. Without the fix this would block indefinitely.
+		if elapsed > 800*time.Millisecond {
+			t.Fatalf("ManageSync timeout took %s; want <800ms", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("listenAndServeTLSWithManager never returned")
+	}
+
+	if bm.started.Load() == 0 {
+		t.Fatal("blockingManager.ManageSync was never invoked")
+	}
+}
+
+// TestPollPool_SeedsSynchronously is the regression for Bug 2.2: without
+// the fix, the pool cache stays empty until the first ticker tick
+// (2s), so requests that land in that window surface as 502s. With the
+// fix, the cache is populated before PollPool begins iterating.
+func TestPollPool_SeedsSynchronously(t *testing.T) {
+	t.Parallel()
+
+	// Stand up a fake /backends handler on a unix socket. The handler
+	// returns one alive backend; the test asserts that by the time
+	// PollPool reaches its ticker loop (well under pollInterval) the
+	// server's pool cache already contains that backend.
+	sockPath := filepath.Join(t.TempDir(), "pool.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	var served atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/backends", func(w http.ResponseWriter, r *http.Request) {
+		served.Add(1)
+		backends := []shared.BackendInfo{
+			{Port: 9050, Alive: true, Backend: "seed.onion"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backends)
+	})
+	httpSrv := &http.Server{Handler: mux}
+	go func() { _ = httpSrv.Serve(ln) }()
+	t.Cleanup(func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutCtx)
+	})
+
+	// Minimal proxy.Server: PollPool only needs cfg to satisfy the
+	// type shape and the pool-cache mutex. We do not exercise any
+	// middleware in this test.
+	s := &Server{cfg: &config.Config{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.PollPool(ctx, sockPath)
+	}()
+
+	// Wait for the synchronous first fetch. Without the fix the pool
+	// stays empty until the first tick (2s); with the fix populated
+	// well under 500ms.
+	deadline := time.Now().Add(1 * time.Second)
+	var got []shared.BackendInfo
+	for time.Now().Before(deadline) {
+		got = s.getPool()
+		if len(got) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(got) == 0 {
+		cancel()
+		<-done
+		t.Fatalf("pool cache still empty after 1s; synchronous seeding failed (served=%d)", served.Load())
+	}
+	if got[0].Backend != "seed.onion" {
+		t.Fatalf("pool[0].Backend = %q, want seed.onion", got[0].Backend)
+	}
+	// Extra belt-and-braces: the fetch should land before pollInterval
+	// (2s) would have fired. We already asserted <1s, so just reuse
+	// that observation and cancel.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PollPool did not exit within 2s of ctx cancel")
 	}
 }

@@ -47,9 +47,40 @@ const (
 	// runtime so that the GC pressure matches the expected deployment.
 	memlimitBytes = 1 << 30 // 1 GB
 
-	// shutdownGrace bounds graceful teardown after ctx cancellation.
-	shutdownGrace = 15 * time.Second
+	// defaultShutdownGrace is the lower-bound shutdown deadline used
+	// when cfg.Pool.ResponseTimeout is zero. Legacy callers relied on
+	// this 15s value; Bug 3.6 makes the grace track ResponseTimeout so
+	// an in-flight Tor request that is still waiting on its upstream
+	// (up to Pool.ResponseTimeout, typically 30s) is not aborted mid
+	// shutdown.
+	defaultShutdownGrace = 15 * time.Second
+
+	// maxShutdownGrace caps the derived shutdown grace. Pool
+	// misconfiguration (or future hub-driven tuning) could otherwise
+	// push grace into minutes; 60s is already past every reasonable
+	// upstream-response ceiling while remaining tolerable for a
+	// systemd/runit TERM deadline.
+	maxShutdownGrace = 60 * time.Second
+
+	// shutdownGraceSlack is added to ResponseTimeout so an upstream
+	// that is literally about to answer is not cut off by the grace
+	// deadline expiring at the same instant ResponseTimeout does.
+	shutdownGraceSlack = 5 * time.Second
 )
+
+// deriveShutdownGrace returns ResponseTimeout+5s, capped at 60s. When
+// ResponseTimeout is zero (legacy or misconfigured) the 15s default
+// kicks in instead so the grace never collapses to the slack alone.
+func deriveShutdownGrace(responseTimeout time.Duration) time.Duration {
+	if responseTimeout <= 0 {
+		return defaultShutdownGrace
+	}
+	grace := responseTimeout + shutdownGraceSlack
+	if grace > maxShutdownGrace {
+		return maxShutdownGrace
+	}
+	return grace
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config file")
@@ -297,26 +328,33 @@ func runWithListener(ctx context.Context, cfg *config.Config, ln net.Listener) e
 		close(errCh)
 	}()
 
+	// Bug 3.6: derive the grace from the pool's ResponseTimeout so an
+	// in-flight Tor request (which may legitimately take up to
+	// Pool.ResponseTimeout to complete) is not cut off by a shorter
+	// shutdown deadline. Clamped at maxShutdownGrace so a misconfigured
+	// pool cannot push the systemd TERM deadline into minutes.
+	grace := deriveShutdownGrace(cfg.Pool.ResponseTimeout)
+
 	// Wait for signal or a fatal serve error.
 	select {
 	case <-ctx.Done():
 		logger.Info("gateway-proxy received shutdown signal")
 	case err, ok := <-errCh:
 		if ok && err != nil {
-			shutdownAll(srv, snapshotClient, metricsServer, tr, tracingShutdown, pollCancel, adminAudit, logger)
+			shutdownAll(srv, snapshotClient, metricsServer, tr, tracingShutdown, pollCancel, adminAudit, logger, grace)
 			return fmt.Errorf("serve: %w", err)
 		}
 	}
 
-	shutdownAll(srv, snapshotClient, metricsServer, tr, tracingShutdown, pollCancel, adminAudit, logger)
+	shutdownAll(srv, snapshotClient, metricsServer, tr, tracingShutdown, pollCancel, adminAudit, logger, grace)
 	return nil
 }
 
-// shutdownAll tears down every subsystem inside shutdownGrace. Safe to
-// call with some subsystems already closed; each step is independent.
-// Ordering: stop accepting traffic → close snapshot client → close
-// transport → flush tracing. Pool poller is cancelled up front so no
-// new admin socket calls race shutdown.
+// shutdownAll tears down every subsystem inside grace. Safe to call with
+// some subsystems already closed; each step is independent. Ordering:
+// stop accepting traffic -> close snapshot client -> close transport ->
+// flush tracing. Pool poller is cancelled up front so no new admin
+// socket calls race shutdown.
 func shutdownAll(
 	srv *proxy.Server,
 	snapshotClient proxy.SnapshotClient,
@@ -326,12 +364,13 @@ func shutdownAll(
 	pollCancel context.CancelFunc,
 	adminAudit *admin.Log,
 	logger *slog.Logger,
+	grace time.Duration,
 ) {
 	if pollCancel != nil {
 		pollCancel()
 	}
 
-	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	shutCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 
 	// 1. Proxy server Shutdown already stops the ratelimit sweeper and

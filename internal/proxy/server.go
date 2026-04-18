@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -149,6 +150,15 @@ func NewServer(cfg *config.Config, t transport.Transport, reg *feature.Registry,
 		},
 		Transport: torTransport,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Bug 3.1: a retryable method whose body exceeds the cap is
+			// surfaced via a sentinel so we return 413 instead of 502;
+			// the caller has a chance to retry with a smaller payload
+			// rather than reading a misleading "bad gateway".
+			if IsRequestBodyTooLarge(err) {
+				slog.Warn("request body exceeds cap", "path", redactPath(s.adminGate, r.URL.Path))
+				serveErrorPage(w, http.StatusRequestEntityTooLarge)
+				return
+			}
 			slog.Error("reverse proxy error", "err", err, "path", redactPath(s.adminGate, r.URL.Path))
 			serveErrorPage(w, http.StatusBadGateway)
 		},
@@ -356,6 +366,21 @@ func (s *Server) ListenAndServe(addr string) error {
 	return s.httpServer.ListenAndServe()
 }
 
+// certManager is the minimal slice of certmagic.Config that
+// ListenAndServeTLS relies on. Factored so tests can inject a fake that
+// blocks ManageSync past the configured deadline without requiring a
+// real ACME interaction.
+type certManager interface {
+	ManageSync(ctx context.Context, domains []string) error
+	TLSConfig() *tls.Config
+}
+
+// manageSyncTimeout bounds the blocking ACME order on startup. The
+// default (60s) is generous enough for a cold HTTP-01 order with
+// retries and short enough that a Let's Encrypt rate-limit or DNS
+// hang surfaces as a startup error rather than an indefinite freeze.
+const manageSyncTimeout = 60 * time.Second
+
 // ListenAndServeTLS obtains a certificate via ACME/CertMagic and starts an
 // HTTPS server on :443. A plain HTTP listener on :80 handles ACME challenges
 // and redirects all other traffic to HTTPS.
@@ -364,7 +389,24 @@ func (s *Server) ListenAndServeTLS(domain, email string) error {
 	certmagic.DefaultACME.Agreed = true
 
 	magic := certmagic.NewDefault()
-	if err := magic.ManageSync(context.Background(), []string{domain}); err != nil {
+	return s.listenAndServeTLSWithManager(context.Background(), domain, magic)
+}
+
+// listenAndServeTLSWithManager is the testable core of ListenAndServeTLS.
+// ctx controls the ManageSync deadline (Bug 2.1: unbounded
+// context.Background() there meant Let's Encrypt rate-limits or DNS
+// hangs froze proxy startup indefinitely). magic is injected so tests
+// can substitute a fake.
+func (s *Server) listenAndServeTLSWithManager(ctx context.Context, domain string, magic certManager) error {
+	// Bug 2.1: bound the blocking ACME order. context.Background() meant
+	// ACME rate-limits or DNS hangs wedged startup with no way for the
+	// caller (cmd/gateway-proxy.run) to surface a non-zero exit code.
+	manageCtx, cancel := context.WithTimeout(ctx, manageSyncTimeout)
+	defer cancel()
+	if err := magic.ManageSync(manageCtx, []string{domain}); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("certmagic manage: timeout after %s: %w", manageSyncTimeout, err)
+		}
 		return fmt.Errorf("certmagic manage: %w", err)
 	}
 
@@ -484,6 +526,13 @@ func adminGateMiddleware(gate *admin.Gate, next http.Handler) http.Handler {
 
 // PollPool connects to the torpool admin Unix socket and refreshes the backend
 // list every pollInterval. It runs until ctx is cancelled.
+//
+// Bug 2.2: the first fetch happens synchronously before the ticker loop
+// starts. Previously a fresh proxy had to wait for the first tick
+// (pollInterval = 2s) before the pool cache was populated, which meant
+// every request in the first 2s resolved to nil from selectBackend and
+// surfaced as a 502. The synchronous fetch respects ctx cancellation so
+// a shutdown during boot cannot block here.
 func (s *Server) PollPool(ctx context.Context, socketPath string) {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
@@ -495,6 +544,16 @@ func (s *Server) PollPool(ctx context.Context, socketPath string) {
 		},
 	}
 
+	// Seed the pool synchronously so requests landing within the first
+	// pollInterval are not forced into the nil-backend 502 path. Errors
+	// here are logged but non-fatal: the ticker loop below retries.
+	if err := s.fetchPool(ctx, client); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("pollPool: initial fetch failed", "err", err)
+	}
+
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -503,30 +562,39 @@ func (s *Server) PollPool(ctx context.Context, socketPath string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/backends", nil)
-			if err != nil {
-				slog.Warn("pollPool: build request", "err", err)
-				continue
+			if err := s.fetchPool(ctx, client); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				slog.Warn("pollPool: fetch failed", "err", err)
 			}
-			resp, err := client.Do(req)
-			if err != nil {
-				slog.Warn("pollPool: request failed", "err", err)
-				continue
-			}
-
-			var backends []shared.BackendInfo
-			if err := json.NewDecoder(resp.Body).Decode(&backends); err != nil {
-				resp.Body.Close()
-				slog.Warn("pollPool: decode response", "err", err)
-				continue
-			}
-			resp.Body.Close()
-
-			s.mu.Lock()
-			s.poolCache = backends
-			s.mu.Unlock()
 		}
 	}
+}
+
+// fetchPool performs a single GET /backends against the admin socket
+// and, on success, replaces s.poolCache. Shared by the synchronous
+// startup fetch and the ticker loop so both paths behave identically.
+func (s *Server) fetchPool(ctx context.Context, client *http.Client) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/backends", nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var backends []shared.BackendInfo
+	if err := json.NewDecoder(resp.Body).Decode(&backends); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+
+	s.mu.Lock()
+	s.poolCache = backends
+	s.mu.Unlock()
+	return nil
 }
 
 // SetPoolCache replaces the cached pool snapshot. Intended for tests
