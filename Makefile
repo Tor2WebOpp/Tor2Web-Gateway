@@ -1,4 +1,4 @@
-.PHONY: build clean test
+.PHONY: build clean test screenshots
 
 build:
 	go build -o bin/gateway-proxy ./cmd/gateway-proxy
@@ -9,3 +9,6 @@ clean:
 
 test:
 	go test ./... -v -race -count=1
+
+screenshots:
+	PATH="/c/msys64/mingw64/bin:$$PATH" go run ./tests/screenshots -out=docs/screenshots

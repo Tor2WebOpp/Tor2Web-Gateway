@@ -1,0 +1,52 @@
+# globals.yaml — runtime feature defaults applied under every tenant.
+#
+# Per-tenant YAML files in ../tenants/ override individual keys.
+# This file is hot-reloaded by the hub's fsnotify watcher; changes
+# propagate to edges via the /v1/config/stream SSE endpoint.
+
+features:
+  blocklist_regex:
+    enabled: true
+    params:
+      default_action: "drop"
+  geoip:
+    enabled: false
+    params:
+      db_path: "/var/lib/gateway/geoip.mmdb"
+      default_action: "404"
+  content_sanitizer:
+    enabled: false
+    params:
+      strip_tags: ["script", "object", "embed", "iframe"]
+  rate_limit:
+    enabled: true
+    params:
+      per_ip_rps: 50
+      per_ip_burst: 100
+  ttl_blocklist:
+    enabled: false
+    params:
+      default_ttl: "24h"
+  abuse_api:
+    enabled: false
+    params:
+      path: "/_abuse"
+  static_cache:
+    enabled: true
+    params:
+      extensions: [".js", ".css", ".png", ".jpg", ".woff2", ".svg"]
+
+block_response:
+  default: "404"
+  timeout_seconds: 30
+
+headers:
+  strip_upstream:
+    - "Server"
+    - "X-Powered-By"
+    - "Via"
+  add_downstream:
+    - name: "X-Frame-Options"
+      value: "DENY"
+    - name: "X-Content-Type-Options"
+      value: "nosniff"

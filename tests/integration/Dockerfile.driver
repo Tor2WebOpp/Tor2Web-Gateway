@@ -1,0 +1,20 @@
+####################################################################
+# Dockerfile.driver — P1 integration test driver
+#
+# Build context: repo root. Produces an alpine image that runs the
+# Go driver against hub + proxies + backends inside the compose net.
+####################################################################
+
+# ---- build stage ----------------------------------------------------
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY gateway/tests/integration/driver/ ./
+# Driver is stdlib-only; init a throwaway module.
+RUN go mod init integration/driver \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/driver .
+
+# ---- runtime stage --------------------------------------------------
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tini
+COPY --from=build /out/driver /usr/local/bin/driver
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/driver"]

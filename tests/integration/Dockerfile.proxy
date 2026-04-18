@@ -1,0 +1,40 @@
+####################################################################
+# Dockerfile.proxy — gateway-proxy integration image
+#
+# Build context: repo root (see docker-compose.p1-integration.yml).
+# Produces a small alpine image running the proxy binary on :443.
+####################################################################
+
+# ---- build stage ----------------------------------------------------
+FROM golang:1.25-alpine AS build
+RUN apk add --no-cache git ca-certificates
+WORKDIR /src
+
+# Copy module graph first for Docker layer caching.
+COPY gateway/go.mod gateway/go.sum ./
+RUN go mod download
+
+# Copy the rest of the gateway source.
+COPY gateway/ ./
+
+# Build gateway-proxy with the integration tag so the proxy knows it
+# is running under the harness (e.g. accept self-signed hub certs).
+RUN go build -tags=integration -trimpath -ldflags="-s -w" \
+      -o /out/gateway-proxy ./cmd/gateway-proxy
+
+# ---- runtime stage --------------------------------------------------
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates curl tini \
+ && adduser -D -u 10002 gateway \
+ && mkdir -p /var/lib/gateway /etc/gateway \
+ && chown -R gateway:gateway /var/lib/gateway /etc/gateway
+
+COPY --from=build /out/gateway-proxy /usr/local/bin/gateway-proxy
+
+USER gateway
+WORKDIR /var/lib/gateway
+
+EXPOSE 80 443
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/gateway-proxy"]
+CMD ["-config", "/etc/gateway/config.yaml"]

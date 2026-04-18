@@ -1,0 +1,52 @@
+####################################################################
+# Dockerfile.hub — gateway-hub integration image
+#
+# Build context: repo root (see docker-compose.p1-integration.yml).
+# Produces a small alpine image running the hub binary on :9080.
+#
+# NOTE: the gateway-hub cmd is being built in phases. If
+# ./cmd/gateway-hub is not yet present, the build falls back to
+# gateway-proxy as a placeholder; the compose file's environment
+# wiring still exercises the integration plumbing.
+####################################################################
+
+# ---- build stage ----------------------------------------------------
+FROM golang:1.25-alpine AS build
+RUN apk add --no-cache git ca-certificates
+WORKDIR /src
+
+# Copy module graph first for Docker layer caching.
+COPY gateway/go.mod gateway/go.sum ./
+RUN go mod download
+
+# Copy the rest of the gateway source.
+COPY gateway/ ./
+
+# Build gateway-hub with the integration tag so test-only hooks
+# (e.g., mTLS-disabled admin listener in the harness) can be gated.
+# Fall back to gateway-proxy if the hub cmd is not yet checked in.
+RUN set -eux; \
+    if [ -d ./cmd/gateway-hub ]; then \
+      go build -tags=integration -trimpath -ldflags="-s -w" \
+        -o /out/gateway-hub ./cmd/gateway-hub; \
+    else \
+      go build -tags=integration -trimpath -ldflags="-s -w" \
+        -o /out/gateway-hub ./cmd/gateway-proxy; \
+    fi
+
+# ---- runtime stage --------------------------------------------------
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates curl tini \
+ && adduser -D -u 10001 gateway \
+ && mkdir -p /var/lib/gateway/hub/runtime/tenants /etc/gateway \
+ && chown -R gateway:gateway /var/lib/gateway /etc/gateway
+
+COPY --from=build /out/gateway-hub /usr/local/bin/gateway-hub
+
+USER gateway
+WORKDIR /var/lib/gateway
+
+EXPOSE 9080
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/gateway-hub"]
+CMD ["-config", "/etc/gateway/config.yaml"]

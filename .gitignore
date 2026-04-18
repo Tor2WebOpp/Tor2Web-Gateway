@@ -3,3 +3,36 @@ config.yaml
 *.sock
 /var/
 .claude/
+
+# Build artefacts -- compiled Go binaries must not be committed.
+# They embed debug paths from the build machine which can leak
+# the contributor's file-system layout.
+*.exe
+/gateway-proxy
+/gateway-torpool
+/gateway-hub
+/gateway-door
+/opsec
+/screenshots
+
+# Editor / IDE scratch
+*.swp
+*.tmp
+.vscode/
+.idea/
+
+# Runtime / operator-private state
+/etc-gateway/
+/var-lib-gateway/
+node-secret
+wg-private.key
+client.crt
+client.key
+admin.env
+hub-ca.pem
+hub-ca.key
+metrics-salt
+
+# OS noise
+.DS_Store
+Thumbs.db

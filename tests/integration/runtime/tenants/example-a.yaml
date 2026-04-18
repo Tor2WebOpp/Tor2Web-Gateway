@@ -1,0 +1,52 @@
+# example-a.yaml — tenant A runtime config.
+#
+# The backend is a real v3 .onion address (generated deterministically
+# from an all-0x01 pubkey). In the integration harness, the onion is
+# resolved by the in-container Tor instance to backend-a:8080 via a
+# local HiddenService mapping — see tor/hs-a/torrc.
+#
+# blocklist_regex is enabled with one rule that matches /wp-admin,
+# which is asserted by driver test 02.
+
+host: "example-a.test"
+enabled: true
+
+backends:
+  - addr: "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion"
+    weight: 1
+
+features:
+  blocklist_regex:
+    enabled: true
+    params:
+      patterns:
+        - pattern: "(?i)wp-(login|admin)"
+          action: "404"
+        - pattern: "\\.env$"
+          action: "drop"
+  static_cache:
+    enabled: true
+    params:
+      extensions: [".css", ".js", ".png", ".svg", ".woff2"]
+  rate_limit:
+    enabled: true
+    params:
+      per_ip_rps: 50
+      per_ip_burst: 100
+
+stealth_hs:
+  enabled: false
+  client_auths: []
+
+negative_cache:
+  enabled: true
+  ttl: "60s"
+  failure_threshold: 3
+
+abuse_api:
+  enabled: false
+  path: "/_abuse"
+  notify_email: ""
+
+# Optional node assignment — empty/absent means "all proxies".
+assigned_nodes: []

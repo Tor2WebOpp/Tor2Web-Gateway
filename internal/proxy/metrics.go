@@ -8,6 +8,31 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// knownMethods is the closed set of HTTP methods that may appear as
+// metric labels. Anything outside this set buckets to "OTHER" so an
+// attacker cannot blow up Prometheus cardinality by rotating the request
+// method (up to MaxHeaderBytes worth of unique values per request).
+var knownMethods = map[string]struct{}{
+	"GET":     {},
+	"POST":    {},
+	"PUT":     {},
+	"PATCH":   {},
+	"DELETE":  {},
+	"HEAD":    {},
+	"OPTIONS": {},
+	"CONNECT": {},
+	"TRACE":   {},
+}
+
+// normalizeMethod returns m when it is a recognised HTTP method, else
+// "OTHER". The label-bound metric emitter must always go through this.
+func normalizeMethod(m string) string {
+	if _, ok := knownMethods[m]; ok {
+		return m
+	}
+	return "OTHER"
+}
+
 var (
 	requestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -90,7 +115,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 		timer.ObserveDuration()
 
 		status := strconv.Itoa(rec.statusCode)
-		requestsTotal.WithLabelValues(r.Method, status).Inc()
+		requestsTotal.WithLabelValues(normalizeMethod(r.Method), status).Inc()
 
 		// Record cache hit/miss based on X-Cache header set by cache middleware.
 		switch rec.Header().Get("X-Cache") {

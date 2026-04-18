@@ -94,7 +94,11 @@ func (v *CFValidator) IsCloudflareIP(ipStr string) bool {
 }
 
 // Middleware rejects requests that do not originate from Cloudflare IPs.
-func (v *CFValidator) Middleware(next http.Handler) http.Handler {
+// hashIP, when non-nil, is called on the client IP before it is logged so
+// raw IP addresses never reach the slog sink. Production callers wire in
+// metrics.Labeler.ClientIP; tests and pre-OPSEC callers may pass nil, in
+// which case the raw IP is logged (legacy behaviour).
+func (v *CFValidator) Middleware(hashIP func(string) string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !v.enabled {
 			next.ServeHTTP(w, r)
@@ -102,7 +106,11 @@ func (v *CFValidator) Middleware(next http.Handler) http.Handler {
 		}
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if !v.IsCloudflareIP(ip) {
-			slog.Warn("non-CF request blocked", "ip", ip)
+			logIP := ip
+			if hashIP != nil {
+				logIP = hashIP(ip)
+			}
+			slog.Warn("non-CF request blocked", "ip", logIP)
 			http.Error(w, "403 Forbidden", http.StatusForbidden)
 			return
 		}

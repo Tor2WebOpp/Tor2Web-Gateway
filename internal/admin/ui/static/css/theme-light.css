@@ -1,0 +1,27 @@
+/* Light neumorphism theme. Applied when <html data-theme="light">. */
+html[data-theme="light"]{
+  --bg: #eef1f5;
+  --bg-elev: #f4f6fa;
+  --bg-sunk: #e4e8ee;
+  --surface: #eef1f5;
+  --surface-hi: #f7f9fc;
+  --surface-lo: #dde2ea;
+  --text: #1d2128;
+  --text-dim: #4a5260;
+  --text-mute: #76808f;
+  --accent: #2d5fd1;
+  --accent-dim: #6d8cd6;
+  --ok: #248a4a;
+  --warn: #a06a10;
+  --error: #c0372a;
+  --border: #d2d8e0;
+  --ring: rgba(45,95,209,.35);
+
+  --shadow-out: 6px 6px 14px rgba(163,177,198,.55), -6px -6px 14px rgba(255,255,255,.9);
+  --shadow-out-sm: 3px 3px 7px rgba(163,177,198,.55), -3px -3px 7px rgba(255,255,255,.9);
+  --shadow-in: inset 4px 4px 10px rgba(163,177,198,.5), inset -4px -4px 10px rgba(255,255,255,.9);
+  --shadow-in-sm: inset 2px 2px 5px rgba(163,177,198,.5), inset -2px -2px 5px rgba(255,255,255,.9);
+  --shadow-flat: 0 1px 0 rgba(255,255,255,.9), 0 0 0 1px rgba(0,0,0,.07);
+
+  color-scheme: light;
+}

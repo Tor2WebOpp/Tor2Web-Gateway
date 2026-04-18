@@ -1,0 +1,79 @@
+# proxy-2.yaml — integration config for the "example-b" edge proxy.
+#
+# Mirror of proxy-1.yaml with tenant B wiring.
+
+mode: remote
+node_type: proxy
+node_id: "proxy-2"
+node_secret_file: "/etc/gateway/node-secret"
+
+hub_url: "https://hub:9080"
+
+transport:
+  kind: wireguard
+  wireguard:
+    interface: "wg0"
+    private_key_file: "/etc/gateway/wg-private.key"
+    peer_pubkey: "placeholder_hub_pubkey_for_integration_test_only"
+    peer_endpoint: "hub:51820"
+    peer_allowed_ips: "10.0.0.1/32"
+    self_ip: "10.0.0.3/24"
+
+mtls:
+  client_cert_file: "/etc/gateway/client.crt"
+  client_key_file: "/etc/gateway/client.key"
+
+domain: "example-b.test"
+email: "ops@example-b.test"
+proxy_secret: "integration_proxy_secret_32_chars_long_xxx"
+
+cloudflare:
+  enabled: false
+  mode: "flexible"
+
+backends:
+  - addr: "backend-b:8080"
+    weight: 1
+
+tor:
+  binary: "tor"
+  socks_base_port: 9050
+  min_instances: 1
+  max_instances: 2
+  data_dir: "/var/lib/gateway/tor"
+  bootstrap_timeout: "30s"
+
+pool:
+  response_timeout: "5s"
+  connect_timeout: "3s"
+
+cache:
+  enabled: true
+  max_size_mb: 16
+  default_ttl: "1m"
+  static_extensions: [".css", ".js", ".png", ".svg", ".woff2"]
+
+rate_limit:
+  per_ip_rps: 50
+  per_ip_burst: 100
+  global_rps: 500
+
+security:
+  # Tenant B intentionally has NO /wp-admin rule so test 03 passes.
+  blocked_paths: []
+  blocked_methods: ["TRACE", "TRACK"]
+
+admin:
+  enabled: true
+  slug: "testslug01234567890123456789abcd"
+  token1: "testtoken011234567890123456789abc"
+  token2: "testtoken022234567890123456789abc"
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+metrics:
+  enabled: false
+  listen: ":9090"

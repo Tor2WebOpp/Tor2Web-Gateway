@@ -1,0 +1,21 @@
+# Banned strings -- project OPSEC. Anything here must not appear
+# in source, binaries, or generated artifacts.
+# Add new bans here; keep comments explaining the reason.
+#
+# Format: one banned substring per line. Case-insensitive.
+# Lines beginning with '#' and blank lines are ignored.
+# This list is editable -- tighten or relax as project needs evolve.
+
+# Add your project codename(s) here, one per line.
+# Example (commented out):
+#   YOURPROJECT
+#
+# Leaving this file with only comments means the linter runs
+# but has nothing to match against. Add at least one entry for
+# OPSEC checks to be meaningful.
+
+# Add more as needed. Examples of what typically belongs here:
+#   - internal project codenames
+#   - personal names / handles of contributors
+#   - URLs of private staging/admin hosts
+#   - analytics/telemetry domains

@@ -1,11 +1,14 @@
 package torpool
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"gateway/internal/shared"
 )
@@ -62,12 +65,20 @@ func NewAPI(mgr *Manager, socketPath string) *API {
 
 	// POST /scale — reads ScaleRequest JSON, calls manager.ScaleTo.
 	mux.HandleFunc("POST /scale", func(w http.ResponseWriter, r *http.Request) {
+		if mgr.IsShuttingDown() {
+			http.Error(w, "manager is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		var req shared.ScaleRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if err := mgr.ScaleTo(r.Context(), req.Target); err != nil {
+			if errors.Is(err, ErrShuttingDown) {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 			http.Error(w, "scale failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -86,7 +97,9 @@ func NewAPI(mgr *Manager, socketPath string) *API {
 	return a
 }
 
-// Serve removes any stale socket, listens, chmod 0660, and serves.
+// Serve removes any stale socket, listens, chmod 0600, and serves.
+// The admin socket is a single-user control plane — 0660 group access
+// was a historical leftover that broadened the privilege surface.
 func (a *API) Serve() error {
 	// Remove stale socket file if present.
 	if err := os.Remove(a.socketPath); err != nil && !os.IsNotExist(err) {
@@ -99,7 +112,7 @@ func (a *API) Serve() error {
 	}
 	a.listener = ln
 
-	if err := os.Chmod(a.socketPath, 0660); err != nil {
+	if err := os.Chmod(a.socketPath, 0600); err != nil {
 		slog.Warn("api: chmod socket failed", "path", a.socketPath, "error", err)
 	}
 
@@ -109,10 +122,25 @@ func (a *API) Serve() error {
 	return nil
 }
 
-// Close shuts down the HTTP server and removes the socket file.
+// Close shuts down the HTTP server gracefully with a 5s deadline and
+// removes the socket file. Uses a default context; callers who need a
+// different deadline should call CloseContext directly.
 func (a *API) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a.CloseContext(ctx)
+}
+
+// CloseContext performs a graceful shutdown bounded by ctx. Existing
+// in-flight requests are allowed to complete before the listener is
+// torn down; if ctx fires first the server is force-closed.
+func (a *API) CloseContext(ctx context.Context) {
 	if a.server != nil {
-		a.server.Close() //nolint:errcheck
+		if err := a.server.Shutdown(ctx); err != nil {
+			// Shutdown returned an error (usually ctx deadline) — fall
+			// back to Close to force the listener down so Serve returns.
+			a.server.Close() //nolint:errcheck
+		}
 	}
 	os.Remove(a.socketPath) //nolint:errcheck
 }

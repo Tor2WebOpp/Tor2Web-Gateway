@@ -56,7 +56,7 @@ func main() {
 	}
 	defer mgr.Shutdown()
 
-	hc := torpool.NewHealthChecker(mgr, cfg.Pool.HealthCheckInterval)
+	hc := torpool.NewHealthCheckerWithGrace(mgr, cfg.Pool.HealthCheckInterval, cfg.Pool.QuarantineGrace)
 	go hc.Run(ctx)
 
 	scaler := torpool.NewScaler(mgr, cfg)

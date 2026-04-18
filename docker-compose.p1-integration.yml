@@ -1,0 +1,204 @@
+##############################################################################
+# docker-compose.p1-integration.yml — P1 end-to-end integration harness
+#
+# Brings up:
+#   - 3 Tor containers (tor-1, tor-2, tor-3) with HiddenService maps
+#   - 2 test backends (backend-a, backend-b)
+#   - 1 gateway-hub (tenant registry, admin API, mTLS CA)
+#   - 2 gateway-proxies (edge for tenant A, edge for tenant B)
+#   - 1 driver (runs the P1 test matrix, exits 0 on success)
+#
+# Run:
+#   cd gateway && docker compose -f docker-compose.p1-integration.yml \
+#     up --abort-on-container-exit --exit-code-from driver
+#
+# The driver's exit code is propagated by --exit-code-from; it equals
+# the number of failed tests.
+#
+# OPSEC: No ports published to host. All traffic is contained inside
+# the compose bridge network. Self-signed TLS everywhere.
+##############################################################################
+
+name: gateway-p1-integration
+
+services:
+
+  # --------------------------------------------------------------------
+  # Tor containers. Each runs a client-mode Tor with one HiddenService
+  # pointing at the corresponding backend so the hub's SOCKS5 requests
+  # are resolved locally inside the compose network. This is the
+  # integration-test shortcut around spinning up the whole Tor network.
+  # --------------------------------------------------------------------
+  tor-1:
+    image: osminogin/tor-simple:latest
+    container_name: p1-tor-1
+    restart: "no"
+    networks: [p1net]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9050 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  tor-2:
+    image: osminogin/tor-simple:latest
+    container_name: p1-tor-2
+    restart: "no"
+    networks: [p1net]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9050 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  tor-3:
+    image: osminogin/tor-simple:latest
+    container_name: p1-tor-3
+    restart: "no"
+    networks: [p1net]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9050 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  # --------------------------------------------------------------------
+  # Backends. One per tenant. Hostnames backend-a / backend-b are
+  # resolvable inside the compose network via embedded DNS.
+  # --------------------------------------------------------------------
+  backend-a:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.backend
+    container_name: p1-backend-a
+    restart: "no"
+    environment:
+      BACKEND_TAG: "example-a"
+      BACKEND_ADDR: ":8080"
+    networks: [p1net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  backend-b:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.backend
+    container_name: p1-backend-b
+    restart: "no"
+    environment:
+      BACKEND_TAG: "example-b"
+      BACKEND_ADDR: ":8080"
+    networks: [p1net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # --------------------------------------------------------------------
+  # gateway-hub — tenant registry + admin API.
+  # Mounts the integration config + runtime YAML tree so tests have
+  # deterministic seed data on boot.
+  # --------------------------------------------------------------------
+  hub:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.hub
+    container_name: p1-hub
+    restart: "no"
+    environment:
+      GATEWAY_MODE: "hub"
+      GATEWAY_INTEGRATION: "1"
+    volumes:
+      - ./tests/integration/config/hub.yaml:/etc/gateway/config.yaml:ro
+      - ./tests/integration/runtime:/var/lib/gateway/hub/runtime:rw
+    networks: [p1net]
+    depends_on:
+      backend-a: { condition: service_healthy }
+      backend-b: { condition: service_healthy }
+      tor-1:     { condition: service_healthy }
+      tor-2:     { condition: service_healthy }
+      tor-3:     { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://127.0.0.1:9080/v1/tenants >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+
+  # --------------------------------------------------------------------
+  # gateway-proxy instances. Each proxy is its own tenant edge.
+  # --------------------------------------------------------------------
+  proxy-1:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.proxy
+    container_name: p1-proxy-1
+    restart: "no"
+    environment:
+      GATEWAY_MODE: "proxy"
+      GATEWAY_INTEGRATION: "1"
+    volumes:
+      - ./tests/integration/config/proxy-1.yaml:/etc/gateway/config.yaml:ro
+    networks: [p1net]
+    depends_on:
+      hub: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate --header='Host: example-a.test' https://127.0.0.1/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  proxy-2:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.proxy
+    container_name: p1-proxy-2
+    restart: "no"
+    environment:
+      GATEWAY_MODE: "proxy"
+      GATEWAY_INTEGRATION: "1"
+    volumes:
+      - ./tests/integration/config/proxy-2.yaml:/etc/gateway/config.yaml:ro
+    networks: [p1net]
+    depends_on:
+      hub: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate --header='Host: example-b.test' https://127.0.0.1/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  # --------------------------------------------------------------------
+  # Driver — runs the test matrix. Exit code = number of failed tests.
+  # --------------------------------------------------------------------
+  driver:
+    build:
+      context: ..
+      dockerfile: gateway/tests/integration/Dockerfile.driver
+    container_name: p1-driver
+    restart: "no"
+    networks: [p1net]
+    depends_on:
+      hub:     { condition: service_healthy }
+      proxy-1: { condition: service_healthy }
+      proxy-2: { condition: service_healthy }
+
+# ----------------------------------------------------------------------
+# Networks. A single bridge network; Docker's embedded DNS resolves the
+# service names used by the driver (hub, proxy-1, proxy-2, backend-*).
+# ----------------------------------------------------------------------
+networks:
+  p1net:
+    driver: bridge
+    name: p1net

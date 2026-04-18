@@ -1,0 +1,72 @@
+# hub.yaml — bootstrap config for the integration hub container.
+#
+# This file is consumed by gateway-hub inside the compose harness.
+# It is intentionally minimal: admin mTLS is DISABLED on the driver-
+# facing listener so the driver can hit /v1/tenants without a client
+# cert. Production hub.yaml requires mTLS.
+#
+# See docker-compose.p1-integration.yml for how this is mounted.
+
+mode: remote
+node_type: hub
+node_id: "hub-integration-0"
+
+# Hub's internal admin/HTTP port — served on 0.0.0.0 inside the
+# docker network. The driver calls https://hub:9080.
+hub:
+  listen_admin: "0.0.0.0:9080"
+  listen_wg: ""
+  # Self-signed cert + key materialised in the image entrypoint or
+  # mounted by compose. Runtime integration tag disables client-cert
+  # enforcement.
+  ca_cert_file: "/etc/gateway/hub-ca.pem"
+  ca_key_file: "/etc/gateway/hub-ca.key"
+  data_dir: "/var/lib/gateway/hub"
+
+# Transport is irrelevant for the hub itself — the edges dial it —
+# but the config loader requires a kind when mode=remote.
+transport:
+  kind: wireguard
+  wireguard:
+    interface: "wg0"
+    private_key_file: "/etc/gateway/wg.key"
+    peer_pubkey: ""
+    peer_endpoint: ""
+    peer_allowed_ips: ""
+    self_ip: "10.0.0.1/24"
+
+hub_url: "https://hub:9080"
+
+# Embedded torpool lives in the hub image. In the harness we skip the
+# real torpool and point SOCKS at backends via Docker DNS — the
+# integration build tag short-circuits torpool spawning.
+tor:
+  binary: "tor"
+  socks_base_port: 9050
+  min_instances: 1
+  max_instances: 2
+  data_dir: "/var/lib/gateway/tor"
+  bootstrap_timeout: "30s"
+
+# mTLS CA material for issuing edge client certs. Generated on first
+# boot if the files do not exist (integration harness behaviour).
+mtls:
+  client_cert_file: "/etc/gateway/client.crt"
+  client_key_file: "/etc/gateway/client.key"
+
+# Admin gate tokens — must match driver/main.go baked-in creds.
+# Slug is 32 chars, tokens are 33 chars each (all >=32 per validator).
+admin:
+  enabled: true
+  slug: "testslug01234567890123456789abcd"
+  token1: "testtoken011234567890123456789abc"
+  token2: "testtoken022234567890123456789abc"
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+metrics:
+  enabled: false
+  listen: ":9090"

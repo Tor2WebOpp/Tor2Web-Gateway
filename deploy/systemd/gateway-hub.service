@@ -1,0 +1,54 @@
+[Unit]
+Description=Gateway Hub (tenant registry, mTLS CA, admin API)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=gateway
+Group=gateway
+ExecStart=/usr/local/bin/gateway-hub --config=/etc/gateway/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65535
+Environment=GOMEMLIMIT=1GiB
+
+# Directories — systemd creates/cleans these automatically.
+RuntimeDirectory=gateway
+RuntimeDirectoryMode=0750
+StateDirectory=gateway gateway/hub gateway/tor
+StateDirectoryMode=0700
+LogsDirectory=gateway
+LogsDirectoryMode=0750
+
+# --- Sandboxing: minimum privilege. ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/gateway /var/log/gateway /run/gateway
+
+[Install]
+WantedBy=multi-user.target

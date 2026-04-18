@@ -1,0 +1,24 @@
+####################################################################
+# Dockerfile.backend — tiny HTTP echo backend
+#
+# Build context: repo root. Produces a scratch image < 10 MB.
+####################################################################
+
+# ---- build stage ----------------------------------------------------
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY gateway/tests/integration/backend/ ./
+# No module graph: backend has zero external deps — stdlib only. We
+# init a throwaway module so go build works without a go.mod in the
+# parent tree having to cover this path.
+RUN go mod init integration/backend \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/backend .
+
+# ---- runtime stage --------------------------------------------------
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates curl tini
+COPY --from=build /out/backend /usr/local/bin/backend
+
+EXPOSE 8080
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/backend"]

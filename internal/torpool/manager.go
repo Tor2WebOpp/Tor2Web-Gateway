@@ -3,8 +3,10 @@ package torpool
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,28 @@ import (
 	"gateway/internal/config"
 	"gateway/internal/shared"
 )
+
+// ErrShuttingDown is returned by mutation operations after Shutdown has
+// been initiated. Callers (notably the /scale API handler) map this to
+// a 503 response.
+var ErrShuttingDown = errors.New("torpool: manager is shutting down")
+
+// waitInstanceExit blocks up to timeout waiting for inst.exited to close,
+// so the OS has a chance to release the SOCKS listen port before we
+// attempt to rebind. Only the per-instance Wait goroutine in spawnInstance
+// is allowed to call cmd.Wait; callers who need to block use this helper.
+// Returns true if the process exited within the timeout, false otherwise.
+func waitInstanceExit(inst *TorInstance, timeout time.Duration) bool {
+	if inst == nil || inst.exited == nil {
+		return true
+	}
+	select {
+	case <-inst.exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
 
 // TorInstance represents a single running Tor process.
 type TorInstance struct {
@@ -32,6 +56,17 @@ type TorInstance struct {
 	Process *os.Process
 	Cancel  context.CancelFunc
 	DataDir string
+
+	// cmd is retained for diagnostics. The underlying cmd.Wait is invoked
+	// exactly once by the background goroutine spawned in spawnInstance;
+	// callers that need to block until the process reaps should select on
+	// exited instead of calling Wait directly (double-Wait is a data race).
+	cmd *exec.Cmd
+
+	// exited is closed by the single background Wait goroutine once the
+	// OS has reaped the process. killAndWait blocks on this channel
+	// (bounded by a timeout) to know the SOCKS port is free.
+	exited chan struct{}
 }
 
 // ID returns the unique identifier for this instance.
@@ -64,7 +99,14 @@ type Manager struct {
 	cfg       *config.Config
 	instances []*TorInstance
 	mu        sync.RWMutex
-	startTime time.Time
+	// opMu serialises mutation operations (ScaleTo, ReplaceInstance,
+	// spawn/add/remove). mu is still held for the short read/write of
+	// the instances slice on hot paths; opMu is held around the larger
+	// kill+wait+spawn sequence to keep concurrent /scale and healthcheck
+	// replace from double-killing or racing spawn-on-bound-port.
+	opMu         sync.Mutex
+	shuttingDown atomic.Bool
+	startTime    time.Time
 }
 
 // NewManager creates a new Manager using the provided config.
@@ -106,7 +148,10 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 // spawnInstance creates a data dir, writes a torrc, starts the tor process,
-// and waits for "Bootstrapped 100%" or the bootstrap timeout.
+// and waits for "Bootstrapped 100%" on either stdout or stderr. On bootstrap
+// timeout it cancels the context, kills the process, and waits up to 5s for
+// the OS to release the SOCKS port before returning — otherwise the zombie
+// tor holds the port and the next respawn fails with "address already in use".
 func (m *Manager) spawnInstance(ctx context.Context, port int, backend string) error {
 	instanceDir := filepath.Join(m.cfg.Tor.DataDir, fmt.Sprintf("tor-%d", port))
 	if err := os.MkdirAll(instanceDir, 0700); err != nil {
@@ -135,40 +180,71 @@ func (m *Manager) spawnInstance(ctx context.Context, port int, backend string) e
 		Backend: backend,
 		Cancel:  cancel,
 		DataDir: instanceDir,
+		exited:  make(chan struct{}),
 	}
 
 	cmd := exec.CommandContext(instCtx, torBin, "-f", torrcPath)
-	cmd.Stderr = os.Stderr
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		close(inst.exited)
 		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	// Route stderr through slog instead of os.Stderr — tor's torrc has
+	// "Log notice stderr" so the bootstrap log and all steady-state
+	// events arrive here. We also scan for "Bootstrapped 100%" on this
+	// stream because tor logs bootstrap progress to stderr, not stdout.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		close(inst.exited)
+		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		close(inst.exited)
 		return fmt.Errorf("start tor process: %w", err)
 	}
 
 	inst.Process = cmd.Process
+	inst.cmd = cmd
 
-	// Monitor stdout for bootstrap completion.
-	bootstrapped := make(chan struct{}, 1)
+	// Start the single cmd.Wait goroutine up front. Any callers needing to
+	// block on process exit must use waitInstanceExit, not call Wait
+	// themselves — multiple goroutines calling Wait on the same cmd is a
+	// data race per os/exec docs.
 	go func() {
-		scanner := bufio.NewScanner(stdoutPipe)
+		cmd.Wait() //nolint:errcheck
+		inst.Alive.Store(false)
+		close(inst.exited)
+	}()
+
+	// Monitor both stdout and stderr for bootstrap completion. Fire the
+	// bootstrapped channel on the first match from either stream; keep
+	// reading after to drain the pipes and forward stderr to slog.
+	bootstrapped := make(chan struct{}, 1)
+	signalBootstrapped := func() {
+		select {
+		case bootstrapped <- struct{}{}:
+		default:
+		}
+	}
+	scanPipe := func(r io.Reader, stream string) {
+		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if strings.Contains(line, "Bootstrapped 100%") {
-				select {
-				case bootstrapped <- struct{}{}:
-				default:
-				}
+				signalBootstrapped()
+			}
+			if stream == "stderr" {
+				slog.Info("tor.stderr", "port", port, "line", line)
 			}
 		}
-		// Drain to avoid blocking
-		io.Copy(io.Discard, stdoutPipe) //nolint:errcheck
-	}()
+	}
+	go scanPipe(stdoutPipe, "stdout")
+	go scanPipe(stderrPipe, "stderr")
 
 	// Wait for bootstrap or timeout.
 	bootstrapTimer := time.NewTimer(timeout)
@@ -178,18 +254,28 @@ func (m *Manager) spawnInstance(ctx context.Context, port int, backend string) e
 	case <-bootstrapped:
 		inst.Alive.Store(true)
 	case <-bootstrapTimer.C:
-		// Timeout: add instance anyway but mark as not alive.
+		// Bootstrap timeout: do NOT leave a zombie holding the SOCKS port.
+		// 1) cancel the context so exec.CommandContext starts teardown
+		// 2) send Kill synchronously in case the OS is slow to react
+		// 3) block on inst.exited (the single Wait goroutine) for up to 5s
 		inst.Alive.Store(false)
+		cancel()
+		if inst.Process != nil {
+			inst.Process.Kill() //nolint:errcheck
+		}
+		if !waitInstanceExit(inst, 5*time.Second) {
+			slog.Warn("torpool: tor process did not exit within 5s after bootstrap timeout",
+				"port", port)
+		}
+		return fmt.Errorf("tor bootstrap timeout after %s on port %d", timeout, port)
 	case <-ctx.Done():
 		cancel()
+		if inst.Process != nil {
+			inst.Process.Kill() //nolint:errcheck
+		}
+		waitInstanceExit(inst, 5*time.Second)
 		return ctx.Err()
 	}
-
-	// Keep process running in background.
-	go func() {
-		cmd.Wait() //nolint:errcheck
-		inst.Alive.Store(false)
-	}()
 
 	m.mu.Lock()
 	m.instances = append(m.instances, inst)
@@ -233,8 +319,52 @@ func (m *Manager) Count() (total, alive int) {
 	return
 }
 
+// doMutation serialises mutation operations (ScaleTo, ReplaceInstance)
+// behind opMu so healthcheck-triggered replaces and operator-triggered
+// scale requests cannot double-kill the same instance or race on a
+// freshly-unbound SOCKS port.
+func (m *Manager) doMutation(ctx context.Context, fn func() error) error {
+	if m.shuttingDown.Load() {
+		return ErrShuttingDown
+	}
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.shuttingDown.Load() {
+		return ErrShuttingDown
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fn()
+}
+
+// killAndWait cancels, kills, and waits (up to 5s) for a Tor process
+// to release its OS resources — most importantly its SOCKS port. Returns
+// true if the process exited cleanly within the timeout. Safe against a
+// nil Process/cmd (the ReplaceInstance-after-failed-spawn path).
+func killAndWait(inst *TorInstance) bool {
+	if inst == nil {
+		return true
+	}
+	inst.Alive.Store(false)
+	if inst.Cancel != nil {
+		inst.Cancel()
+	}
+	if inst.Process != nil {
+		inst.Process.Kill() //nolint:errcheck
+	}
+	return waitInstanceExit(inst, 5*time.Second)
+}
+
 // ScaleTo adjusts the number of instances to the target, clamped to [min, max].
 func (m *Manager) ScaleTo(ctx context.Context, target int) error {
+	return m.doMutation(ctx, func() error {
+		return m.scaleToLocked(ctx, target)
+	})
+}
+
+// scaleToLocked is the body of ScaleTo, callable only with opMu held.
+func (m *Manager) scaleToLocked(ctx context.Context, target int) error {
 	min := m.cfg.Tor.MinInstances
 	max := m.cfg.Tor.MaxInstances
 	if target < min {
@@ -249,21 +379,21 @@ func (m *Manager) ScaleTo(ctx context.Context, target int) error {
 
 	if target < current {
 		// Scale down -- kill worst-scoring instances.
+		// Sort ascending: best (lowest Score) first, worst (dead → MaxFloat64) last.
+		// Then keep [:target] and kill the tail, so dead instances die first and
+		// alive ones survive.
 		sort.Slice(m.instances, func(i, j int) bool {
 			return m.instances[i].Info().Score() < m.instances[j].Info().Score()
 		})
-		// Worst are now at the end; take them out.
 		toKill := make([]*TorInstance, len(m.instances[target:]))
 		copy(toKill, m.instances[target:])
 		m.instances = m.instances[:target]
 		m.mu.Unlock()
 
+		// Wait after each kill so SOCKS ports are released before the caller
+		// (or the next ScaleTo) tries to rebind.
 		for _, inst := range toKill {
-			inst.Cancel()
-			inst.Alive.Store(false)
-			if inst.Process != nil {
-				inst.Process.Kill() //nolint:errcheck
-			}
+			killAndWait(inst)
 		}
 		return nil
 	}
@@ -301,48 +431,63 @@ func (m *Manager) ScaleTo(ctx context.Context, target int) error {
 	return nil
 }
 
-// ReplaceInstance kills the instance on the given port and spawns a replacement on the same port+backend.
+// ReplaceInstance kills the instance on the given port and spawns a replacement
+// on the same port+backend. It blocks on the dead process's Wait before
+// respawning so the SOCKS port is free when the new tor attempts to bind.
 func (m *Manager) ReplaceInstance(ctx context.Context, port int) error {
-	m.mu.Lock()
-	var dead *TorInstance
-	idx := -1
-	for i, inst := range m.instances {
-		if inst.Port == port {
-			dead = inst
-			idx = i
-			break
+	return m.doMutation(ctx, func() error {
+		m.mu.Lock()
+		var dead *TorInstance
+		idx := -1
+		for i, inst := range m.instances {
+			if inst.Port == port {
+				dead = inst
+				idx = i
+				break
+			}
 		}
-	}
-	if dead == nil {
+		if dead == nil {
+			m.mu.Unlock()
+			return fmt.Errorf("no instance on port %d", port)
+		}
+		// Remove from slice while holding the lock.
+		m.instances = append(m.instances[:idx], m.instances[idx+1:]...)
 		m.mu.Unlock()
-		return fmt.Errorf("no instance on port %d", port)
-	}
-	// Remove from slice while holding the lock.
-	m.instances = append(m.instances[:idx], m.instances[idx+1:]...)
-	m.mu.Unlock()
 
-	// Kill the dead instance.
-	dead.Cancel()
-	dead.Alive.Store(false)
-	if dead.Process != nil {
-		dead.Process.Kill() //nolint:errcheck
-	}
+		// Kill the dead instance, then block on Wait so the OS releases the
+		// SOCKS port before we attempt to respawn on it.
+		killAndWait(dead)
 
-	// Spawn a replacement.
-	return m.spawnInstance(ctx, port, dead.Backend)
+		// Spawn a replacement on the now-free port.
+		return m.spawnInstance(ctx, port, dead.Backend)
+	})
 }
 
-// Shutdown cancels all running instances.
+// Shutdown cancels all running instances. Sets the shuttingDown flag so
+// subsequent ScaleTo / ReplaceInstance calls fail fast with ErrShuttingDown.
 func (m *Manager) Shutdown() {
+	m.shuttingDown.Store(true)
+	// Best-effort cooperation with doMutation — acquire opMu so we drain any
+	// in-flight mutation. Callers of Shutdown expect synchronous teardown.
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, inst := range m.instances {
-		inst.Cancel()
 		inst.Alive.Store(false)
+		if inst.Cancel != nil {
+			inst.Cancel()
+		}
 		if inst.Process != nil {
 			inst.Process.Kill() //nolint:errcheck
 		}
 	}
+}
+
+// IsShuttingDown reports whether Shutdown has been called. Used by the
+// API handler to return 503 on /scale after shutdown has started.
+func (m *Manager) IsShuttingDown() bool {
+	return m.shuttingDown.Load()
 }
 
 // UptimeSec returns the number of seconds since the manager was created.

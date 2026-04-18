@@ -1,0 +1,94 @@
+# proxy-1.yaml — integration config for the "example-a" edge proxy.
+#
+# The proxy runs in remote mode, dials the hub over the compose bridge
+# network (service name: hub), and serves tenant example-a.test on
+# :443 with a self-signed cert.
+#
+# Must validate via internal/config: remote mode needs hub_url and
+# transport.kind.
+
+mode: remote
+node_type: proxy
+node_id: "proxy-1"
+node_secret_file: "/etc/gateway/node-secret"
+
+# Points at the hub service over the compose network. In prod this
+# would be the wg-private IP; here Docker DNS does the same job.
+hub_url: "https://hub:9080"
+
+# Transport plumbing — even though the integration harness shortcuts
+# the real WG tunnel, the schema requires a valid kind. "wireguard"
+# is chosen as the canonical default per the spec.
+transport:
+  kind: wireguard
+  wireguard:
+    interface: "wg0"
+    private_key_file: "/etc/gateway/wg-private.key"
+    peer_pubkey: "placeholder_hub_pubkey_for_integration_test_only"
+    peer_endpoint: "hub:51820"
+    peer_allowed_ips: "10.0.0.1/32"
+    self_ip: "10.0.0.2/24"
+
+mtls:
+  client_cert_file: "/etc/gateway/client.crt"
+  client_key_file: "/etc/gateway/client.key"
+
+# --- legacy/local fields kept for backward compat in the binary ---
+# The current binary still reads these and they let the harness fall
+# back to gateway-proxy behaviour if a hub-aware build isn't
+# available. Use .test to avoid colliding with real TLDs.
+domain: "example-a.test"
+email: "ops@example-a.test"
+
+# 32+ char dummy — required by config.validate for local fallback.
+proxy_secret: "integration_proxy_secret_32_chars_long_xxx"
+
+cloudflare:
+  enabled: false
+  mode: "flexible"
+
+backends:
+  - addr: "backend-a:8080"
+    weight: 1
+
+tor:
+  binary: "tor"
+  socks_base_port: 9050
+  min_instances: 1
+  max_instances: 2
+  data_dir: "/var/lib/gateway/tor"
+  bootstrap_timeout: "30s"
+
+pool:
+  response_timeout: "5s"
+  connect_timeout: "3s"
+
+cache:
+  enabled: true
+  max_size_mb: 16
+  default_ttl: "1m"
+  static_extensions: [".css", ".js", ".png", ".svg", ".woff2"]
+
+rate_limit:
+  per_ip_rps: 50
+  per_ip_burst: 100
+  global_rps: 500
+
+security:
+  blocked_paths: []  # tenant rules handle per-tenant blocks
+  blocked_methods: ["TRACE", "TRACK"]
+
+admin:
+  enabled: true
+  slug: "testslug01234567890123456789abcd"
+  token1: "testtoken011234567890123456789abc"
+  token2: "testtoken022234567890123456789abc"
+
+logging:
+  level: "debug"
+  format: "json"
+  output: "stdout"
+
+metrics:
+  enabled: false
+  listen: ":9090"

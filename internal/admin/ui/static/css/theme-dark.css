@@ -1,0 +1,27 @@
+/* Dark neumorphism theme. Applied when <html data-theme="dark">. */
+html[data-theme="dark"]{
+  --bg: #1a1d22;
+  --bg-elev: #1f2329;
+  --bg-sunk: #14171b;
+  --surface: #24282f;
+  --surface-hi: #2a2f37;
+  --surface-lo: #1c1f25;
+  --text: #e6e8ec;
+  --text-dim: #9aa3b1;
+  --text-mute: #6c7687;
+  --accent: #8ab4ff;
+  --accent-dim: #4a6fb3;
+  --ok: #6dd38a;
+  --warn: #f2c66d;
+  --error: #f0755f;
+  --border: #2f343c;
+  --ring: rgba(138,180,255,.45);
+
+  --shadow-out: 6px 6px 14px rgba(0,0,0,.55), -6px -6px 14px rgba(255,255,255,.025);
+  --shadow-out-sm: 3px 3px 7px rgba(0,0,0,.55), -3px -3px 7px rgba(255,255,255,.025);
+  --shadow-in: inset 4px 4px 10px rgba(0,0,0,.55), inset -4px -4px 10px rgba(255,255,255,.03);
+  --shadow-in-sm: inset 2px 2px 5px rgba(0,0,0,.5), inset -2px -2px 5px rgba(255,255,255,.03);
+  --shadow-flat: 0 1px 0 rgba(255,255,255,.02), 0 0 0 1px rgba(0,0,0,.35);
+
+  color-scheme: dark;
+}

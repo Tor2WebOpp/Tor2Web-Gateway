@@ -1,0 +1,45 @@
+# example-b.yaml — tenant B runtime config.
+#
+# Deliberately does NOT define a blocklist_regex rule for /wp-admin.
+# Driver test 03 asserts that the same path which gets blocked on
+# tenant A is allowed here — demonstrating per-tenant isolation.
+
+host: "example-b.test"
+enabled: true
+
+backends:
+  - addr: "aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibejsqd.onion"
+    weight: 1
+
+features:
+  # Blocklist is still "enabled" but the patterns list is empty so
+  # nothing actually matches. Proves enabled != has-rules.
+  blocklist_regex:
+    enabled: true
+    params:
+      patterns: []
+  static_cache:
+    enabled: true
+    params:
+      extensions: [".css", ".js", ".png", ".svg", ".woff2"]
+  rate_limit:
+    enabled: true
+    params:
+      per_ip_rps: 50
+      per_ip_burst: 100
+
+stealth_hs:
+  enabled: false
+  client_auths: []
+
+negative_cache:
+  enabled: true
+  ttl: "60s"
+  failure_threshold: 3
+
+abuse_api:
+  enabled: false
+  path: "/_abuse"
+  notify_email: ""
+
+assigned_nodes: []

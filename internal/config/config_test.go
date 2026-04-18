@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -281,6 +282,7 @@ func TestLoad_Validation(t *testing.T) {
 		{
 			name: "empty domain",
 			yaml: `
+mode: local
 proxy_secret: "thisisaverylongsecretthatisatleast32chars"
 backends:
   - addr: "127.0.0.1:8080"
@@ -293,6 +295,7 @@ tor:
 		{
 			name: "short secret",
 			yaml: `
+mode: local
 domain: example.com
 proxy_secret: "tooshort"
 backends:
@@ -306,6 +309,7 @@ tor:
 		{
 			name: "no backends",
 			yaml: `
+mode: local
 domain: example.com
 proxy_secret: "thisisaverylongsecretthatisatleast32chars"
 tor:
@@ -314,17 +318,161 @@ tor:
 			wantErr: "at least one backend is required",
 		},
 		{
-			name: "min_instances zero",
+			name: "invalid mode",
 			yaml: `
+mode: chaos
+node_type: local
 domain: example.com
 proxy_secret: "thisisaverylongsecretthatisatleast32chars"
 backends:
   - addr: "127.0.0.1:8080"
     weight: 1
 tor:
-  min_instances: 0
+  min_instances: 2
 `,
-			wantErr: "tor.min_instances must be greater than 0",
+			wantErr: "mode must be one of",
+		},
+		{
+			name: "invalid node_type",
+			yaml: `
+mode: local
+node_type: banana
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+`,
+			wantErr: "node_type must be one of",
+		},
+		{
+			name: "remote without hub_url",
+			yaml: `
+mode: remote
+node_type: proxy
+transport:
+  kind: wireguard
+`,
+			wantErr: "hub_url is required when mode=remote",
+		},
+		{
+			name: "remote with invalid transport",
+			yaml: `
+mode: remote
+node_type: proxy
+hub_url: "http://10.0.0.1:9080"
+transport:
+  kind: carrier_pigeon
+`,
+			wantErr: "transport.kind must be",
+		},
+		{
+			name: "admin enabled with short slug",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+admin:
+  enabled: true
+  slug: "tooshort"
+  token1: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  token2: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+`,
+			wantErr: "admin.slug must be at least 32",
+		},
+		{
+			name: "admin enabled with short token1",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+admin:
+  enabled: true
+  slug: "ssssssssssssssssssssssssssssssss"
+  token1: "short"
+  token2: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+`,
+			wantErr: "admin.token1 must be at least 32",
+		},
+		{
+			name: "admin enabled with short token2",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+admin:
+  enabled: true
+  slug: "ssssssssssssssssssssssssssssssss"
+  token1: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  token2: "x"
+`,
+			wantErr: "admin.token2 must be at least 32",
+		},
+		// T9 — cross-field Tor validations.
+		{
+			name: "min > max rejected",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 10
+  max_instances: 4
+`,
+			wantErr: "tor.min_instances must be <= max_instances",
+		},
+		{
+			name: "base_port + max exceeds 65535",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+  max_instances: 1000
+  socks_base_port: 65000
+`,
+			wantErr: "socks_base_port + max_instances exceeds port range",
+		},
+		{
+			name: "scale up <= scale down rejected",
+			yaml: `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+pool:
+  scale_up_threshold: 0.3
+  scale_down_threshold: 0.7
+`,
+			wantErr: "pool.scale_up_threshold must be > scale_down_threshold",
 		},
 	}
 
@@ -341,6 +489,183 @@ tor:
 				}
 			}
 		})
+	}
+}
+
+// TestLoad_LegacyBackwardCompat confirms a pre-P1 config without an explicit
+// `mode:` still loads — install.sh may not have been rerun yet.
+func TestLoad_LegacyBackwardCompat(t *testing.T) {
+	legacy := `
+domain: example.com
+email: admin@example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+
+tor:
+  min_instances: 3
+
+admin:
+  socket: /tmp/gateway-admin.sock
+`
+	path := writeTempConfig(t, legacy)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(legacy) error = %v", err)
+	}
+	if cfg.Mode != ModeLocal {
+		t.Errorf("Mode = %q, want %q (inferred from presence of backends)", cfg.Mode, ModeLocal)
+	}
+	if cfg.NodeType != NodeTypeLocal {
+		t.Errorf("NodeType = %q, want %q (default)", cfg.NodeType, NodeTypeLocal)
+	}
+	if cfg.Admin.Enabled {
+		t.Error("Admin.Enabled = true, want false by default")
+	}
+	if cfg.Admin.Socket != "/tmp/gateway-admin.sock" {
+		t.Errorf("Admin.Socket = %q, want legacy value preserved", cfg.Admin.Socket)
+	}
+}
+
+func TestLoad_RemoteMode_Wireguard(t *testing.T) {
+	y := `
+mode: remote
+node_type: proxy
+hub_url: "http://10.0.0.1:9080"
+node_id: "edge-7a3c"
+transport:
+  kind: wireguard
+  wireguard:
+    interface: wg0
+    private_key_file: /etc/gateway/wg-private.key
+    peer_pubkey: "abc"
+    peer_endpoint: "hub.lan:51820"
+    peer_allowed_ips: "10.0.0.1/32"
+    self_ip: "10.0.0.42/24"
+mtls:
+  client_cert_file: /etc/gateway/client.crt
+  client_key_file: /etc/gateway/client.key
+`
+	path := writeTempConfig(t, y)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(remote wg) error = %v", err)
+	}
+	if cfg.Mode != ModeRemote || cfg.NodeType != NodeTypeProxy {
+		t.Errorf("Mode=%q NodeType=%q", cfg.Mode, cfg.NodeType)
+	}
+	if cfg.Transport.Kind != TransportWireguard {
+		t.Errorf("Transport.Kind = %q", cfg.Transport.Kind)
+	}
+	if cfg.Transport.Wireguard.SelfIP != "10.0.0.42/24" {
+		t.Errorf("SelfIP = %q", cfg.Transport.Wireguard.SelfIP)
+	}
+}
+
+func TestLoad_RemoteMode_HTTPSTunnel(t *testing.T) {
+	y := `
+mode: remote
+node_type: proxy
+hub_url: "https://hub.example:8443"
+transport:
+  kind: https_tunnel
+  https_tunnel:
+    hub_url: "https://hub.example:8443"
+    ca_cert_file: /etc/gateway/hub-ca.pem
+`
+	path := writeTempConfig(t, y)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(remote https_tunnel) error = %v", err)
+	}
+	if cfg.Transport.Kind != TransportHTTPSTunnel {
+		t.Errorf("Transport.Kind = %q", cfg.Transport.Kind)
+	}
+	if cfg.Transport.HTTPSTunnel.HubURL != "https://hub.example:8443" {
+		t.Errorf("HTTPSTunnel.HubURL = %q", cfg.Transport.HTTPSTunnel.HubURL)
+	}
+}
+
+func TestLoad_RemoteMode_SOCKS5TLS(t *testing.T) {
+	y := `
+mode: remote
+node_type: proxy
+hub_url: "https://hub.example:9443"
+transport:
+  kind: socks5_tls
+  socks5_tls:
+    hub_addr: "hub.example:9443"
+    admin_addr: "hub.example:9444"
+    ca_cert_file: /etc/gateway/hub-ca.pem
+`
+	path := writeTempConfig(t, y)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(remote socks5_tls) error = %v", err)
+	}
+	if cfg.Transport.SOCKS5TLS.AdminAddr != "hub.example:9444" {
+		t.Errorf("SOCKS5TLS.AdminAddr = %q", cfg.Transport.SOCKS5TLS.AdminAddr)
+	}
+}
+
+func TestLoad_RemoteMode_DefaultTransportIsWireguard(t *testing.T) {
+	y := `
+mode: remote
+node_type: proxy
+hub_url: "http://10.0.0.1:9080"
+`
+	path := writeTempConfig(t, y)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(remote, no transport) error = %v", err)
+	}
+	if cfg.Transport.Kind != TransportWireguard {
+		t.Errorf("Transport.Kind = %q, want default %q", cfg.Transport.Kind, TransportWireguard)
+	}
+}
+
+func TestLoad_AdminEnabled_ValidTokens(t *testing.T) {
+	y := `
+mode: local
+domain: example.com
+proxy_secret: "thisisaverylongsecretthatisatleast32chars"
+backends:
+  - addr: "127.0.0.1:8080"
+    weight: 1
+tor:
+  min_instances: 2
+admin:
+  enabled: true
+  slug: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  token1: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  token2: "cccccccccccccccccccccccccccccccccc"
+`
+	path := writeTempConfig(t, y)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(admin enabled) error = %v", err)
+	}
+	if !cfg.Admin.Enabled {
+		t.Error("Admin.Enabled = false")
+	}
+}
+
+// TestFillDefaults_Idempotent confirms calling fillDefaults twice yields the
+// same structure — important because hot-reload may invoke it repeatedly.
+func TestFillDefaults_Idempotent(t *testing.T) {
+	cfg := &Config{
+		Mode:     ModeLocal,
+		NodeType: NodeTypeLocal,
+		Tor:      TorConf{MinInstances: 3},
+		Backends: []BackendConf{{Addr: "x", Weight: 0}},
+	}
+	fillDefaults(cfg)
+	snapshot := *cfg
+	fillDefaults(cfg)
+	if !reflect.DeepEqual(*cfg, snapshot) {
+		t.Error("fillDefaults not idempotent")
 	}
 }
 

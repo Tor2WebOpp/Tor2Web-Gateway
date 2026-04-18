@@ -3,38 +3,9 @@ package proxy
 import (
 	"log/slog"
 	"net/http"
-	"strings"
+
+	"gateway/internal/admin"
 )
-
-// blockedPathsMiddleware returns a 404 for requests whose path starts with any
-// of the given prefixes.
-func blockedPathsMiddleware(paths []string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for _, p := range paths {
-			if strings.HasPrefix(r.URL.Path, p) {
-				http.NotFound(w, r)
-				return
-			}
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// blockedMethodsMiddleware returns 405 for requests that use one of the
-// disallowed HTTP methods.
-func blockedMethodsMiddleware(methods []string, next http.Handler) http.Handler {
-	blocked := make(map[string]struct{}, len(methods))
-	for _, m := range methods {
-		blocked[strings.ToUpper(m)] = struct{}{}
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := blocked[r.Method]; ok {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
 
 // securityHeadersMiddleware adds hardening response headers before calling next.
 // Information-leaking upstream headers (Server, X-Powered-By, Via) must be
@@ -53,17 +24,59 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// writeProbe is a thin ResponseWriter wrapper used solely by
+// recoveryMiddleware to know whether anything has already been committed
+// to the wire when a panic fires. It does NOT swallow duplicate writes —
+// the underlying writer's WriteHeader policy is preserved — it only
+// records the fact that bytes/headers have flowed downstream.
+type writeProbe struct {
+	http.ResponseWriter
+	written bool
+}
+
+func (p *writeProbe) WriteHeader(code int) {
+	p.written = true
+	p.ResponseWriter.WriteHeader(code)
+}
+
+func (p *writeProbe) Write(b []byte) (int, error) {
+	p.written = true
+	return p.ResponseWriter.Write(b)
+}
+
 // recoveryMiddleware catches panics from downstream handlers, logs them with
 // a stack trace, and returns a 500 response instead of crashing the server.
-func recoveryMiddleware(next http.Handler) http.Handler {
+// When gate is non-nil and enabled, the logged path has any admin slug/token
+// segments redacted so a panic from anywhere in the chain cannot leak the
+// gate's secret path components.
+//
+// If the panic fires AFTER any byte has already been committed to the
+// client (status line or body), we cannot safely write a 500: the second
+// write would smuggle a fake header inline into the chunked body the
+// client is parsing. In that case we log and return; the deferred
+// connection close surfaces a truncated body to the client, which is
+// strictly safer than corrupted framing.
+func recoveryMiddleware(gate *admin.Gate, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probe := &writeProbe{ResponseWriter: w}
 		defer func() {
 			if rec := recover(); rec != nil {
-				slog.Error("panic recovered", "panic", rec, "path", r.URL.Path)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				slog.Error("panic recovered",
+					"panic", rec,
+					"path", redactPath(gate, r.URL.Path),
+					"already_written", probe.written,
+				)
+				if probe.written {
+					// Headers/body already in flight — do not call
+					// http.Error; the second WriteHeader would corrupt
+					// the chunked stream. The client sees a truncated
+					// body when the connection closes.
+					return
+				}
+				http.Error(probe, "Internal Server Error", http.StatusInternalServerError)
 			}
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(probe, r)
 	})
 }
 

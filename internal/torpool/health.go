@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -32,6 +33,14 @@ func (f *failureTracker) recordSuccess() {
 	f.mu.Unlock()
 }
 
+// reset clears the failure counter. Called after a successful replace so
+// we don't immediately re-flag the new instance on the next tick.
+func (f *failureTracker) reset() {
+	f.mu.Lock()
+	f.consecutive = 0
+	f.mu.Unlock()
+}
+
 // isDead reports whether the failure count has reached the threshold.
 func (f *failureTracker) isDead() bool {
 	f.mu.Lock()
@@ -40,20 +49,51 @@ func (f *failureTracker) isDead() bool {
 	return dead
 }
 
-// HealthChecker periodically probes all Tor instances and replaces dead ones.
+// quarantineEntry tracks an instance that has been quarantined after its
+// failure counter crossed threshold. While quarantined the Tor process stays
+// alive and is still probed on every tick; the instance is simply pulled
+// out of the load-balancer via Alive=false. If a probe succeeds the
+// entry is cleared and traffic resumes. If the grace period elapses with
+// no recovery, the instance is replaced.
+type quarantineEntry struct {
+	since     time.Time
+	expiresAt time.Time
+}
+
+// HealthChecker periodically probes all Tor instances, quarantines those that
+// exceed the failure threshold, and replaces instances that fail to recover
+// within the quarantine grace period.
 type HealthChecker struct {
 	mgr             *Manager
 	interval        time.Duration
+	quarantineGrace time.Duration
 	trackers        sync.Map // port (int) -> *failureTracker
 	wg              sync.WaitGroup
 	probeTransports sync.Map // port (int) -> *http.Transport
+	// replacing guards against a goroutine leak during an outage: without
+	// it, every tick that still sees the instance as dead spawns another
+	// replace goroutine, producing hundreds of parallel replaces per port.
+	// LoadOrStore + CompareAndSwap(false, true) gates entry; defer clears.
+	replacing sync.Map // port (int) -> *atomic.Bool
+	// quarantined holds ports currently in the quarantine state.
+	quarantined sync.Map // port (int) -> *quarantineEntry
 }
 
 // NewHealthChecker returns a HealthChecker that checks at the given interval.
+// The quarantine grace defaults to 5 minutes; use NewHealthCheckerWithGrace
+// to override.
 func NewHealthChecker(mgr *Manager, interval time.Duration) *HealthChecker {
+	return NewHealthCheckerWithGrace(mgr, interval, 5*time.Minute)
+}
+
+// NewHealthCheckerWithGrace returns a HealthChecker with an explicit
+// quarantine grace period. When grace is zero or negative the checker
+// falls back to the previous replace-on-threshold behaviour.
+func NewHealthCheckerWithGrace(mgr *Manager, interval, quarantineGrace time.Duration) *HealthChecker {
 	return &HealthChecker{
-		mgr:      mgr,
-		interval: interval,
+		mgr:             mgr,
+		interval:        interval,
+		quarantineGrace: quarantineGrace,
 	}
 }
 
@@ -105,25 +145,93 @@ func (h *HealthChecker) checkOne(ctx context.Context, inst *TorInstance) {
 		inst.ErrorCount.Add(1)
 		tracker.recordFailure()
 
-		if tracker.isDead() {
-			inst.Alive.Store(false)
-			// Remove the stale probe transport for this port.
-			h.removeProbeTransport(inst.Port)
-			// Attempt to replace asynchronously to avoid blocking the check loop.
-			h.wg.Add(1)
-			go func(port int) {
-				defer h.wg.Done()
-				replaceCtx, cancel := context.WithTimeout(context.Background(), h.mgr.cfg.Tor.BootstrapTimeout+10*time.Second)
-				defer cancel()
-				h.mgr.ReplaceInstance(replaceCtx, port) //nolint:errcheck
-			}(inst.Port)
+		if !tracker.isDead() {
+			return
 		}
+
+		// Threshold crossed. Pull the instance out of the load-balancer
+		// immediately (Score() treats Alive=false as infinitely bad) so
+		// new requests stop routing here while we wait to see if it
+		// recovers. The Tor process keeps running.
+		inst.Alive.Store(false)
+		h.removeProbeTransport(inst.Port)
+
+		// Tor hidden-service reachability has known 30-60s stall windows
+		// during intro-point refresh. A 5-minute quarantine lets these
+		// resolve without the expense of killing + bootstrapping a new
+		// Tor process. Only if the instance is still failing at grace
+		// expiry do we escalate to replacement.
+		if h.quarantineGrace <= 0 {
+			h.replaceAsync(inst.Port)
+			return
+		}
+
+		now := time.Now()
+		if q, ok := h.quarantinedEntry(inst.Port); ok {
+			if now.After(q.expiresAt) {
+				h.clearQuarantine(inst.Port)
+				h.replaceAsync(inst.Port)
+			}
+			return
+		}
+
+		h.quarantined.Store(inst.Port, &quarantineEntry{
+			since:     now,
+			expiresAt: now.Add(h.quarantineGrace),
+		})
 		return
 	}
 
 	tracker.recordSuccess()
+	// A successful probe lifts any quarantine in place and restores the
+	// instance to the load-balancer without the new-circuit cost of a
+	// full replace.
+	h.clearQuarantine(inst.Port)
 	inst.Alive.Store(true)
 	inst.LatencyMs.Store(latency)
+}
+
+// quarantinedEntry returns the current quarantine entry for a port, if any.
+func (h *HealthChecker) quarantinedEntry(port int) (*quarantineEntry, bool) {
+	v, ok := h.quarantined.Load(port)
+	if !ok {
+		return nil, false
+	}
+	return v.(*quarantineEntry), true
+}
+
+// clearQuarantine removes the quarantine entry for a port. Safe to call
+// when the port is not quarantined.
+func (h *HealthChecker) clearQuarantine(port int) {
+	h.quarantined.Delete(port)
+}
+
+// replaceAsync fires one replacement goroutine per port. The per-port flag
+// blocks subsequent ticks from piling on while the first replace is in
+// flight; concurrent ticks simply return without scheduling another.
+func (h *HealthChecker) replaceAsync(port int) {
+	v, _ := h.replacing.LoadOrStore(port, &atomic.Bool{})
+	flag := v.(*atomic.Bool)
+	if !flag.CompareAndSwap(false, true) {
+		return
+	}
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		defer flag.Store(false)
+		replaceCtx, cancel := context.WithTimeout(context.Background(), h.mgr.cfg.Tor.BootstrapTimeout+10*time.Second)
+		defer cancel()
+		if err := h.mgr.ReplaceInstance(replaceCtx, port); err != nil {
+			// Keep going — the next tick will re-arm the flag.
+			return
+		}
+		// Success: reset the failure tracker so we don't immediately
+		// flag the fresh instance as dead on the next tick before it
+		// has completed its first probe.
+		if t, ok := h.trackers.Load(port); ok {
+			t.(*failureTracker).reset()
+		}
+	}()
 }
 
 // trackerFor returns (creating if necessary) the failure tracker for a port.
@@ -133,33 +241,31 @@ func (h *HealthChecker) trackerFor(port int) *failureTracker {
 }
 
 // getProbeTransport returns a cached *http.Transport for the given SOCKS port,
-// creating one on first use.
-func (h *HealthChecker) getProbeTransport(socksPort int) *http.Transport {
+// creating one on first use. Returns an error if the dialer does not implement
+// proxy.ContextDialer — the non-context fallback ignored cancellation and
+// leaked goroutines under timeouts.
+func (h *HealthChecker) getProbeTransport(socksPort int) (*http.Transport, error) {
 	if v, ok := h.probeTransports.Load(socksPort); ok {
-		return v.(*http.Transport)
+		return v.(*http.Transport), nil
 	}
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
 	if err != nil {
-		// Fallback: direct transport (should not happen with static args).
-		tr := &http.Transport{}
-		h.probeTransports.Store(socksPort, tr)
-		return tr
+		return nil, fmt.Errorf("socks5 dialer for port %d: %w", socksPort, err)
+	}
+	cd, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return nil, fmt.Errorf("socks5 dialer for port %d does not implement ContextDialer", socksPort)
 	}
 
-	tr := &http.Transport{}
-	if cd, ok := dialer.(proxy.ContextDialer); ok {
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return cd.DialContext(ctx, network, addr)
-		}
-	} else {
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
-		}
+		},
 	}
 	h.probeTransports.Store(socksPort, tr)
-	return tr
+	return tr, nil
 }
 
 // removeProbeTransport closes idle connections and removes the cached transport
@@ -173,7 +279,10 @@ func (h *HealthChecker) removeProbeTransport(socksPort int) {
 // probeTorSOCKS dials the backend via the Tor SOCKS5 proxy and sends a HEAD
 // request.  Any HTTP response counts as success (the circuit is working).
 func (h *HealthChecker) probeTorSOCKS(ctx context.Context, socksPort int, backend string) error {
-	transport := h.getProbeTransport(socksPort)
+	transport, err := h.getProbeTransport(socksPort)
+	if err != nil {
+		return err
+	}
 
 	client := &http.Client{
 		Transport: transport,
