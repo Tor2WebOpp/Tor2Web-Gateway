@@ -1,4 +1,4 @@
-# TOR  Gateway
+# TOR Gateway
 
 **High-performance Tor routing gateway** — a two-component system that manages a dynamic pool of Tor instances and routes HTTP/HTTPS traffic through them with automatic TLS, caching, rate limiting, and health-based load balancing.
 
