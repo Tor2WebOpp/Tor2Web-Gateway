@@ -672,13 +672,19 @@ func (s *tenantState) connCountsSize() int {
 	return n
 }
 
-// matchesAnyPrefix reports whether path starts with any of prefixes.
+// matchesAnyPrefix reports whether path starts with any of prefixes,
+// case-insensitively. Case folding closes a strict/lenient rate-limit
+// split where /API/users bypassed the /api/ prefix and fell back to the
+// per-IP limiter (default 30 rps) instead of the stricter api limiter
+// (default 5 rps). Upstream routers that normalise case (IIS, servers
+// that strings.ToLower before matching) made the mismatch exploitable.
 func matchesAnyPrefix(path string, prefixes []string) bool {
+	lowered := strings.ToLower(path)
 	for _, p := range prefixes {
 		if p == "" {
 			continue
 		}
-		if strings.HasPrefix(path, p) {
+		if strings.HasPrefix(lowered, strings.ToLower(p)) {
 			return true
 		}
 	}

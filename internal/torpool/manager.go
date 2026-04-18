@@ -638,9 +638,19 @@ func (m *Manager) Shutdown() {
 	// in-flight mutation. Callers of Shutdown expect synchronous teardown.
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
+
+	// Snapshot the instance list under m.mu and release it before the
+	// kill loop. Process.Kill / ctx.Cancel make syscalls that can block
+	// for milliseconds; holding m.mu through them stalls every reader
+	// (notably the API /backends handler and HealthChecker.Instances())
+	// for the duration of the sweep. Once m.instances is drained under
+	// the write lock, the snapshot is ours to iterate safely.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, inst := range m.instances {
+	snapshot := m.instances
+	m.instances = nil
+	m.mu.Unlock()
+
+	for _, inst := range snapshot {
 		inst.Alive.Store(false)
 		if inst.Cancel != nil {
 			inst.Cancel()
@@ -679,7 +689,6 @@ NewCircuitPeriod 60
 SocksTimeout 60
 MaxClientCircuitsPending 256
 ConnectionPadding auto
-FetchDirInfoEarly 1
 `, socksPort, instanceDir)
 
 	return os.WriteFile(torrcPath, []byte(content), 0600)

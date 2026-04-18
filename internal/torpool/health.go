@@ -3,6 +3,7 @@ package torpool
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -184,12 +185,16 @@ func (h *HealthChecker) checkOne(ctx context.Context, inst *TorInstance) {
 		now := time.Now()
 		if q, ok := h.quarantinedEntry(inst.Port); ok {
 			if now.After(q.expiresAt) {
+				slog.Warn("torpool: quarantine grace expired, replacing instance",
+					"port", inst.Port, "quarantined_for", now.Sub(q.since).String())
 				h.clearQuarantine(inst.Port)
 				h.replaceAsync(inst.Port)
 			}
 			return
 		}
 
+		slog.Warn("torpool: instance quarantined after consecutive probe failures",
+			"port", inst.Port, "grace", h.quarantineGrace.String(), "probe_error", err.Error())
 		h.quarantined.Store(inst.Port, &quarantineEntry{
 			since:     now,
 			expiresAt: now.Add(h.quarantineGrace),
@@ -201,6 +206,9 @@ func (h *HealthChecker) checkOne(ctx context.Context, inst *TorInstance) {
 	// A successful probe lifts any quarantine in place and restores the
 	// instance to the load-balancer without the new-circuit cost of a
 	// full replace.
+	if _, wasQuarantined := h.quarantinedEntry(inst.Port); wasQuarantined {
+		slog.Info("torpool: instance recovered from quarantine", "port", inst.Port)
+	}
 	h.clearQuarantine(inst.Port)
 	inst.Alive.Store(true)
 	inst.LatencyMs.Store(latency)
@@ -230,6 +238,7 @@ func (h *HealthChecker) replaceAsync(port int) {
 	if !flag.CompareAndSwap(false, true) {
 		return
 	}
+	slog.Info("torpool: replacing dead instance", "port", port)
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
@@ -238,8 +247,10 @@ func (h *HealthChecker) replaceAsync(port int) {
 		defer cancel()
 		if err := h.mgr.ReplaceInstance(replaceCtx, port); err != nil {
 			// Keep going — the next tick will re-arm the flag.
+			slog.Error("torpool: replace failed, next tick will retry", "port", port, "error", err)
 			return
 		}
+		slog.Info("torpool: replace succeeded", "port", port)
 		// Success: reset the failure tracker so we don't immediately
 		// flag the fresh instance as dead on the next tick before it
 		// has completed its first probe.

@@ -213,26 +213,34 @@ func NewServer(cfg *config.Config, t transport.Transport, reg *feature.Registry,
 	// runs so upload-heavy abuse never reaches features/backends.
 	handler = maxBodyMiddleware(maxBodyBytes, handler)
 
-	// 9. Recovery: turns downstream panics into 500s. The gate is passed
-	// in so the logged path redacts admin slug/tokens when they appear.
-	handler = recoveryMiddleware(gate, handler)
-
-	// 10. Metrics: wraps the outermost layer below the admin gate so
-	// admin paths are NOT tracked (keeps the gate invisible in exported
-	// metrics). The labeler is accepted but not yet threaded into the
-	// legacy counter set; wave-3 wiring is tracked separately.
+	// 9. Metrics: wraps the layer below the admin gate so admin paths
+	// are NOT tracked (keeps the gate invisible in exported metrics).
+	// The labeler is accepted but not yet threaded into the legacy
+	// counter set; wave-3 wiring is tracked separately.
 	handler = metricsMiddleware(handler)
 
-	// 11. Admin gate (outermost). MatchesPrefix/ServeHTTP enforce the
-	// constant-time carve-out even when the gate is disabled. This
-	// MUST be the first thing every request encounters so nothing
-	// below sees admin paths.
+	// 10. Admin gate. MatchesPrefix/ServeHTTP enforce the constant-time
+	// carve-out even when the gate is disabled. This MUST be the first
+	// thing every request sees after recovery so nothing below it ever
+	// observes admin paths.
 	handler = adminGateMiddleware(gate, handler)
+
+	// 11. Recovery (outermost). A panic in metricsMiddleware or the
+	// adminGate handler used to crash the process because recovery was
+	// further in. Wrapping it outermost turns any panic in the full
+	// middleware chain into a 500 (or a silent close when headers are
+	// already on the wire) instead of killing the server. The gate is
+	// passed in so the logged path redacts admin slug/tokens.
+	handler = recoveryMiddleware(gate, handler)
 
 	s.httpServer = &http.Server{
 		Handler:           handler,
 		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 2 * time.Second,
+		// 2s was too tight for mobile clients on slow 3G/4G, where the
+		// TLS-handshake-to-first-byte interval legitimately hits the high
+		// hundreds of milliseconds. 5s is still well inside slowloris
+		// territory but does not drop real users.
+		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 * 1024, // 64 KB
