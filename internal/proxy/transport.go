@@ -345,6 +345,15 @@ func (t *TorTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Fail fast when the caller has already given up. Without this,
+		// a client disconnect still burned all maxAttempts retries against
+		// the pool — each attempt immediately erroring with ctx.Canceled,
+		// but wasting circuit-building and pool-selection work along the
+		// way. Checking ctx at loop-head lets us surface the cancellation
+		// as the real cause instead of the last SOCKS-level error.
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		// Build a filtered pool excluding already-tried ports and any
 		// backends whose (tenant, onion) is negatively cached.
 		available := make([]shared.BackendInfo, 0, len(pool))

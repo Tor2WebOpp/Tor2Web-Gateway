@@ -600,15 +600,25 @@ func (f *Feature) serve(w http.ResponseWriter, r *http.Request, state *tenantSta
 
 	ip := clientIP(r, state.cfg.TrustXFF)
 
-	// Per-IP concurrent-connection cap.
+	// Per-IP concurrent-connection cap. The previous Load-check-then-Add
+	// pattern had a TOCTOU race: N concurrent requests from the same IP
+	// could all observe count=limit-1, all increment, and the effective
+	// cap became limit+N-1. CAS loop below atomically rejects when the
+	// current value is already at the cap, or bumps it in one step.
 	if state.cfg.PerIPConns > 0 {
 		tracker := state.getConnTracker(ip)
 		tracker.lastSeen.Store(time.Now().UnixNano())
-		if tracker.count.Load() >= int64(state.cfg.PerIPConns) {
-			applyAction(w, r, state.cfg)
-			return
+		cap := int64(state.cfg.PerIPConns)
+		for {
+			cur := tracker.count.Load()
+			if cur >= cap {
+				applyAction(w, r, state.cfg)
+				return
+			}
+			if tracker.count.CompareAndSwap(cur, cur+1) {
+				break
+			}
 		}
-		tracker.count.Add(1)
 		defer func() {
 			tracker.count.Add(-1)
 			tracker.lastSeen.Store(time.Now().UnixNano())

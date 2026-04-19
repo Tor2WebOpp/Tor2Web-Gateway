@@ -277,15 +277,22 @@ func (f *Feature) Middleware(res feature.Resolver) func(http.Handler) http.Handl
 					return &sfResult{tooBig: true}, nil
 				}
 
+				// Strip hop-by-hop headers before we stash or share the
+				// response: Connection, Transfer-Encoding, Keep-Alive,
+				// Upgrade, Te, Trailer, Proxy-Authenticate/Authorization
+				// are per-connection per RFC 7230 §6.1 and must never
+				// cross a cache boundary.
+				sharedHdr := cloneHeader(rec.header)
+				stripHopByHop(sharedHdr)
 				res := &sfResult{
 					statusCode: rec.statusCode,
-					header:     cloneHeader(rec.header),
+					header:     sharedHdr,
 					body:       append([]byte(nil), rec.body.Bytes()...),
 				}
 				if cacheableResponse(rec) {
 					entry := &cacheEntry{
 						StatusCode: rec.statusCode,
-						Header:     cloneHeader(rec.header),
+						Header:     cloneHeader(sharedHdr),
 						Body:       append([]byte(nil), rec.body.Bytes()...),
 					}
 					cost := int64(len(entry.Body))
@@ -642,6 +649,40 @@ func cloneHeader(h http.Header) http.Header {
 		out[k] = cp
 	}
 	return out
+}
+
+// hopByHopHeaders per RFC 7230 §6.1. These are per-connection and MUST
+// NOT be stored in a shared cache or replayed to a different client:
+// doing so would glue a prior connection's framing metadata onto a fresh
+// response and break chunked-encoding / Upgrade handling downstream.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// stripHopByHop removes RFC 7230 hop-by-hop headers from h in place.
+// Also removes every header named by a Connection: <name> listing, per
+// the same RFC: Connection is itself the mechanism by which custom
+// hop-by-hop headers are declared.
+func stripHopByHop(h http.Header) {
+	if conns := h.Values("Connection"); len(conns) > 0 {
+		for _, line := range conns {
+			for _, tok := range strings.Split(line, ",") {
+				if name := strings.TrimSpace(tok); name != "" {
+					h.Del(name)
+				}
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
 }
 
 // -----------------------------------------------------------------------

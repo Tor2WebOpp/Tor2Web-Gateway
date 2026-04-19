@@ -340,6 +340,34 @@ func validate(cfg *Config) error {
 		return errors.New("pool.scale_up_threshold must be > scale_down_threshold")
 	}
 
+	// Negative durations silently break ticker-based code paths:
+	// time.NewTicker(-5s) panics on construction, so a bootstrap with
+	// a misconfigured health_check_interval / bootstrap_timeout would
+	// crash the process seconds after the service came up. Reject at
+	// load time so systemd sees the failure once, not in a loop.
+	durationChecks := []struct {
+		name string
+		val  time.Duration
+	}{
+		{"tor.bootstrap_timeout", cfg.Tor.BootstrapTimeout},
+		{"pool.idle_timeout", cfg.Pool.IdleTimeout},
+		{"pool.response_timeout", cfg.Pool.ResponseTimeout},
+		{"pool.connect_timeout", cfg.Pool.ConnectTimeout},
+		{"pool.health_check_interval", cfg.Pool.HealthCheckInterval},
+		{"pool.rebalance_interval", cfg.Pool.RebalanceInterval},
+		{"pool.scale_cooldown", cfg.Pool.ScaleCooldown},
+		{"pool.quarantine_grace", cfg.Pool.QuarantineGrace},
+		{"cache.default_ttl", cfg.Cache.DefaultTTL},
+		{"rate_limit.cleanup_interval", cfg.RateLimit.CleanupInterval},
+		{"admin.session_idle_ttl", cfg.Admin.SessionIdleTTL},
+		{"admin.session_absolute_ttl", cfg.Admin.SessionAbsoluteTTL},
+	}
+	for _, d := range durationChecks {
+		if d.val < 0 {
+			return fmt.Errorf("%s cannot be negative, got %s", d.name, d.val)
+		}
+	}
+
 	if cfg.Admin.Enabled {
 		if len(cfg.Admin.Slug) < 32 {
 			return errors.New("admin.slug must be at least 32 characters when admin.enabled")
