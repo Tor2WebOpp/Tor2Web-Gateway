@@ -127,12 +127,15 @@ func (l *Log) Write(e Event) error {
 	if err := l.ensureDayFileLocked(e.Time); err != nil {
 		return err
 	}
-	// JSONL — one event per line.
-	if _, err := l.curF.Write(payload); err != nil {
+	// JSONL — one event per line. Concat payload+'\n' into a single
+	// buffer and issue one Write so a partial success (disk full between
+	// the two writes) cannot leave a newline-less payload on disk that
+	// would glue into the next record and corrupt JSONL scanning.
+	line := make([]byte, 0, len(payload)+1)
+	line = append(line, payload...)
+	line = append(line, '\n')
+	if _, err := l.curF.Write(line); err != nil {
 		return fmt.Errorf("admin: write audit line: %w", err)
-	}
-	if _, err := l.curF.Write([]byte{'\n'}); err != nil {
-		return fmt.Errorf("admin: write audit newline: %w", err)
 	}
 	if err := l.curF.Sync(); err != nil {
 		return fmt.Errorf("admin: fsync audit: %w", err)

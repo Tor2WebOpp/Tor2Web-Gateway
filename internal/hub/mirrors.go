@@ -559,7 +559,10 @@ func (r *MirrorRegistry) startWatcher(ctx context.Context) error {
 
 	go func() {
 		defer w.Close()
-		var timer *time.Timer
+		var (
+			timer *time.Timer
+			cbMu  sync.Mutex
+		)
 		for {
 			select {
 			case <-ctx.Done():
@@ -578,9 +581,18 @@ func (r *MirrorRegistry) startWatcher(ctx context.Context) error {
 				if !strings.HasSuffix(strings.ToLower(base), mirrorExt) {
 					continue
 				}
+				// Serialize the debounced callback: AfterFunc fires on
+				// its own goroutine; an event landing mid-execution
+				// would otherwise Reset() and schedule a concurrent
+				// invocation that double-broadcasts mirror diffs.
 				if timer == nil {
-					timer = time.AfterFunc(watchDebounce, r.onExternalChange)
+					timer = time.AfterFunc(watchDebounce, func() {
+						cbMu.Lock()
+						defer cbMu.Unlock()
+						r.onExternalChange()
+					})
 				} else {
+					timer.Stop()
 					timer.Reset(watchDebounce)
 				}
 			case _, ok := <-w.Errors:

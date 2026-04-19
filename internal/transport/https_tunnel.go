@@ -210,15 +210,26 @@ func (h *HTTPSTunnel) DialSOCKS(ctx context.Context, port int) (net.Conn, error)
 	}
 
 	// Also react to ctx cancellation that happens mid-write/read by
-	// closing the conn from a watcher goroutine.
+	// closing the conn from a watcher goroutine. The watcher must exit
+	// BEFORE this function returns the conn to the caller — otherwise
+	// a ctx that cancels a hair after CONNECT succeeds races the defer
+	// and the watcher may close the conn the caller just received.
+	// Pattern: stopped chan is closed only by the watcher after it
+	// picks a branch; the deferred Wait blocks until the watcher
+	// commits to a non-close path.
 	done := make(chan struct{})
-	defer close(done)
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		select {
 		case <-ctx.Done():
 			_ = tlsConn.Close()
 		case <-done:
 		}
+	}()
+	defer func() {
+		close(done)
+		<-stopped
 	}()
 
 	req := fmt.Sprintf(

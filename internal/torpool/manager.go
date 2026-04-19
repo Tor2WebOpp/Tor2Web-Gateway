@@ -359,12 +359,19 @@ func (m *Manager) spawnInstance(ctx context.Context, port int, backend string) e
 	// stream because tor logs bootstrap progress to stderr, not stdout.
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
+		// stdoutPipe's FDs are Go's responsibility to close once allocated.
+		// Normally cmd.Wait() does that — but we're erroring before Wait
+		// will ever be called, so close it explicitly here.
+		_ = stdoutPipe.Close()
 		cancel()
 		close(inst.exited)
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		// Same rationale: no Wait() means pipes won't be reaped.
+		_ = stdoutPipe.Close()
+		_ = stderrPipe.Close()
 		cancel()
 		close(inst.exited)
 		return fmt.Errorf("start tor process: %w", err)

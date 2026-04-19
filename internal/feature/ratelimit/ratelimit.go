@@ -344,6 +344,7 @@ type Feature struct {
 
 	// sweep coordination
 	sweeperOnce sync.Once
+	stopOnce    sync.Once
 	sweeperDone chan struct{}
 	sweeperWG   sync.WaitGroup
 	// sweepInterval is set when the sweeper is started; tests may
@@ -491,14 +492,14 @@ func (f *Feature) Start() {
 	})
 }
 
-// Stop ends the sweeper and waits for it to exit.
+// Stop ends the sweeper and waits for it to exit. Idempotent: concurrent
+// and repeat calls are safe. Without stopOnce the previous check-then-close
+// pattern was a landmine — two goroutines could both see the channel open,
+// both call close, and panic. Single-caller today but trivial to make robust.
 func (f *Feature) Stop() {
-	select {
-	case <-f.sweeperDone:
-		// already closed
-	default:
+	f.stopOnce.Do(func() {
 		close(f.sweeperDone)
-	}
+	})
 	f.sweeperWG.Wait()
 }
 
@@ -710,9 +711,15 @@ func applyAction(w http.ResponseWriter, r *http.Request, cfg params) {
 		if d <= 0 {
 			d = time.Duration(defaultTimeoutSeconds) * time.Second
 		}
+		// time.After keeps its backing goroutine+timer alive for the
+		// full duration even if the select picks ctx.Done first — under
+		// rate-limit abuse that leaks memory proportional to req-rate×d.
+		// NewTimer+Stop releases the timer immediately on early exit.
+		t := time.NewTimer(d)
 		select {
-		case <-time.After(d):
+		case <-t.C:
 		case <-r.Context().Done():
+			t.Stop()
 		}
 		w.Header().Set("Retry-After", "3")
 		http.Error(w, "", http.StatusRequestTimeout)

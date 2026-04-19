@@ -171,7 +171,23 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/health", a.requireMTLS(a.proxyTorpool("/health", http.MethodGet)))
 	mux.HandleFunc("POST /v1/scale", a.requireMTLS(a.proxyTorpool("/scale", http.MethodPost)))
 
-	return mux
+	// Cap every request body before it reaches a handler. json.Decoder has
+	// no built-in upper bound, so a misbehaving (even authenticated) client
+	// could stream an arbitrarily large object and force the hub to allocate
+	// unbounded memory during Decode. 1 MiB comfortably exceeds the largest
+	// tenant/globals/mirror payload we emit while blocking abusive bodies.
+	return limitRequestBodies(mux, 1<<20)
+}
+
+// limitRequestBodies wraps every inbound request with http.MaxBytesReader so
+// no downstream Decode/Read can allocate past maxBytes.
+func limitRequestBodies(h http.Handler, maxBytes int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // requireMTLS wraps a handler, enforcing valid mTLS peer cert and

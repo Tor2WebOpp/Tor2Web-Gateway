@@ -503,9 +503,14 @@ func applyAction(w http.ResponseWriter, r *http.Request, action shared.BlockActi
 			t = time.Now
 		}
 		deadline := t().Add(30 * time.Second)
+		// NewTimer+Stop rather than time.After: when ctx fires first
+		// under abuse the backing timer would otherwise survive the
+		// full 30s, leaking memory proportional to req-rate × 30s.
+		timer := newStallTimer(deadline, t)
 		select {
 		case <-r.Context().Done():
-		case <-timeAfterUntil(deadline, t):
+			timer.Stop()
+		case <-timer.C:
 		}
 		w.WriteHeader(http.StatusRequestTimeout)
 	default: // BlockActionNotFound and any future safe default
@@ -513,13 +518,15 @@ func applyAction(w http.ResponseWriter, r *http.Request, action shared.BlockActi
 	}
 }
 
-// timeAfterUntil returns a channel that fires at deadline according to
-// nowFn. Isolated so that tests using a fake clock can keep the stall
-// deterministic without a sleeping goroutine.
-func timeAfterUntil(deadline time.Time, nowFn func() time.Time) <-chan time.Time {
+// newStallTimer returns a *time.Timer that fires at deadline according
+// to nowFn. Isolated so tests with a fake clock keep the stall
+// deterministic without a sleeping goroutine; returning a timer (rather
+// than a channel) lets the caller Stop() early on ctx cancel so the
+// runtime releases the timer immediately instead of keeping it live.
+func newStallTimer(deadline time.Time, nowFn func() time.Time) *time.Timer {
 	d := deadline.Sub(nowFn())
 	if d < 0 {
 		d = 0
 	}
-	return time.After(d)
+	return time.NewTimer(d)
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -168,7 +169,10 @@ func (s *Storage) Watch(ctx context.Context, onChange func()) error {
 
 	go func() {
 		defer w.Close()
-		var timer *time.Timer
+		var (
+			timer *time.Timer
+			cbMu  sync.Mutex
+		)
 		for {
 			select {
 			case <-ctx.Done():
@@ -183,9 +187,19 @@ func (s *Storage) Watch(ctx context.Context, onChange func()) error {
 				if !s.relevantEvent(ev) {
 					continue
 				}
+				// Serialize the debounced callback so an event arriving
+				// right as the previous invocation is still running does
+				// not reenter it: AfterFunc fires on its own goroutine, and
+				// Reset() mid-execution schedules another concurrent
+				// fire that would read/broadcast an inconsistent snapshot.
 				if timer == nil {
-					timer = time.AfterFunc(watchDebounce, onChange)
+					timer = time.AfterFunc(watchDebounce, func() {
+						cbMu.Lock()
+						defer cbMu.Unlock()
+						onChange()
+					})
 				} else {
+					timer.Stop()
 					timer.Reset(watchDebounce)
 				}
 			case _, ok := <-w.Errors:
